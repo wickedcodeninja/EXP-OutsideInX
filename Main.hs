@@ -3,17 +3,22 @@
 import Prelude hiding ( )
 
 import Data.Foldable
+import Control.Monad
+import Control.Applicative
+
 
 import Data.Set ( Set (..), union, isSubsetOf, intersection )
 import qualified Data.Set as Set
+
+
 
 type Var = ()
 
 -- Always associate to right? Maybe 
 data Constraint = And Constraint Constraint | Empty
-
+  deriving (Eq, Ord)
 data ImplicationConstraint = Implication Constraint ExtendedConstraint Touchables
-
+  deriving (Eq, Ord)
 type ExtendedConstraint = (Constraint, [ImplicationConstraint])
 
 
@@ -39,6 +44,9 @@ fuv = undefined
   
 type Solver a = Either String a
 
+oops :: String -> Solver a
+oops = Left 
+
 class SubstApply a where
   applySubst :: Subst -> a -> a
 
@@ -60,6 +68,7 @@ assert b s = if b then return () else error s
 (#) :: Set Var -> Set Var -> Bool
 a # b = Set.null (a `intersection` b) 
  
+
 solver :: Toplevel                    --Top-level constraints
        -> Constraint                  --Q_Given
        -> Touchables                  --Touchables
@@ -75,11 +84,11 @@ solver tl given tch wanted = do
   
       recSolver (Implication q_i c_i tch_i) = do
         (r_i, subst_i) <- solver tl (given `And` (residual `And` q_i)) tch_i c_i
-        case r_i of
-          Empty -> return ()
-          _     -> Left $ "solver: could not fully discharge implication constraint because <insert reason here>"
+        
+        when (r_i /= Empty) $ 
+          oops $ "solver: could not fully discharge implication constraint because <insert reason here>"
   
-  -- Recursively solve all the implication constraints, ignoring generated substitutions
+  -- Recursively solve all the implication constraints, discarding generated substitutions
   -- which are internal to the implication constraint.
   _ <- traverse_ recSolver simplifiedWanted
   
