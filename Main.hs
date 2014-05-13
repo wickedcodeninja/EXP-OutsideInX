@@ -1,6 +1,6 @@
-{-# LANGUAGE TypeSynonymInstances, FlexibleInstances #-}
+{-# LANGUAGE TypeSynonymInstances, FlexibleInstances, LambdaCase #-}
 
-import Prelude hiding ( )
+import Prelude hiding ( null )
 
 import Data.Monoid
 import Data.Foldable hiding ( msum )
@@ -17,20 +17,37 @@ import Data.Set ( Set (..), union, isSubsetOf, intersection )
 import qualified Data.Set as Set
 import qualified Data.Map as Map
 
-
--- Always associate to right? Maybe 
-data Constraint = And Constraint Constraint | Empty
+data Equality = Equality
   deriving (Eq, Ord)
-data ImplicationConstraint = Implication Constraint ExtendedConstraint Touchables
+   
+data Constraint 
+  = EqualityConstraint Equality 
+  | TypeclassConstraint
   deriving (Eq, Ord)
-type ExtendedConstraint = (Constraint, [ImplicationConstraint])
 
+data Implication 
+  = Implication (Set Constraint) (Set ExtendedConstraint) Touchables
+  deriving (Eq, Ord)
 
-simplePart :: ExtendedConstraint -> Constraint
-simplePart (c, _) = c
+data ExtendedConstraint 
+  = BaseConstraint Constraint 
+  | ImplicationConstraint Implication
+  deriving (Eq, Ord)
 
-implicationPart :: ExtendedConstraint -> [ImplicationConstraint]
-implicationPart (_, i) = i
+unionMap :: (Ord a, Ord b) => Set a -> (a -> Set b) -> Set b
+unionMap m f = flatten (Set.map f m)
+
+flatten :: Ord a => Set (Set a) -> Set a
+flatten = Set.unions . toList
+
+simplePart :: Set ExtendedConstraint -> Set Constraint
+simplePart m = unionMap m $ \case BaseConstraint b        -> Set.singleton b
+                                  ImplicationConstraint i -> Set.empty
+                                    
+implicationPart :: Set ExtendedConstraint -> Set Implication
+implicationPart m = unionMap m $ \case BaseConstraint _        -> Set.empty
+                                       ImplicationConstraint i -> Set.singleton i
+                                    
 
 type Toplevel = ()
 type Touchables = Set FUV
@@ -46,7 +63,7 @@ instance Monoid Subst where
 dom :: Subst -> Set FUV 
 dom = undefined  
   
-fuv :: Constraint -> Set FUV
+fuv :: Set Constraint -> Set FUV
 fuv = undefined
  
 
@@ -91,10 +108,11 @@ class SubstApply a where
   applySubst :: Subst -> a -> a
 
 instance SubstApply ExtendedConstraint where
-  applySubst subst (c, is) 
-    = (applySubst subst c, map (applySubst subst) is)
+  applySubst subst (BaseConstraint b) = BaseConstraint (applySubst subst b)
+  applySubst subst (ImplicationConstraint i) = ImplicationConstraint (applySubst subst i)
+  
 
-instance SubstApply ImplicationConstraint where
+instance SubstApply Implication where
   applySubst subst (Implication c e tch) -- assert tch # fuv(subst) ?
     = Implication (applySubst subst c) (applySubst subst e) tch
 
@@ -102,6 +120,9 @@ instance SubstApply Constraint where
   applySubst subst _ 
     = error "Substitutions on Constraints not implemented yet"
 
+instance SubstApply a => SubstApply (Set a) where
+  applySubst = undefined
+    
 release_mode :: Bool
 release_mode = False
  
@@ -116,22 +137,22 @@ free :: Solver FUV
 free = StateT $ \fuv -> Value (fuv, succ fuv)
  
 solver :: Toplevel                    --Top-level constraints
-       -> Constraint                  --Q_Given
+       -> Set Constraint              --Q_Given
        -> Touchables                  --Touchables
-       -> ExtendedConstraint          --C_Wanted                
-       -> Solver (Constraint, Subst)  --(Q_Residual; Subst)
+       -> Set ExtendedConstraint      --C_Wanted                
+       -> Solver (Set Constraint, Subst)  --(Q_Residual; Subst)
 solver tl given tch wanted = do
   (residual, subst) <- simplifier tl given tch (simplePart wanted)
   
   assert (dom subst # fuv given) $ "solver: domain of substitution is not disjoint from fuv(given)" 
   assert (dom subst `isSubsetOf` tch) $ "solver: domain of substitution not a subset of touchables" 
   
-  let simplifiedWanted = map (applySubst subst) (implicationPart wanted)
+  let simplifiedWanted = Set.map (applySubst subst) (implicationPart wanted)
   
       recSolver (Implication q_i c_i tch_i) = do
-        (r_i, subst_i) <- solver tl (given `And` (residual `And` q_i)) tch_i c_i
+        (r_i, subst_i) <- solver tl (given `union` (residual `union` q_i)) tch_i c_i
         
-        when (r_i /= Empty) $ 
+        when (not $ Set.null r_i) $ 
           fail $ "solver: could not fully discharge implication constraint because <insert reason here>"
   
   -- Recursively solve all the implication constraints, discarding generated substitutions
@@ -141,22 +162,22 @@ solver tl given tch wanted = do
   --   
   return (residual, subst)
   
-type Quadruple = (Touchables, Subst, Constraint, Constraint)
+type Quadruple = (Touchables, Subst, Set Constraint, Set Constraint)
   
 -- Rewrite the quadruple until no more rewrite steps are possible
 rewriter :: Toplevel -> Quadruple -> Solver Quadruple
 rewriter tl = return
   
 -- page 66: 7.5, (2)
-seperateEqualities :: Constraint -> ( Set Constraint -- Type Equalities
-                                    , Constraint     -- Residual
-                                    )
+seperateEqualities :: Set Constraint -> ( Set Equality    -- Type Equalities
+                                        , Set Constraint  -- Residual
+                                        )
 seperateEqualities = undefined
 
 
 
 -- page 66: 7.5, (3)
-extractSubstitution :: Set Constraint -> Subst
+extractSubstitution :: Set Equality -> Subst
 extractSubstitution = undefined
 
 -- page 66: 7.5, SIMPLES
@@ -164,11 +185,11 @@ restrictSubstitution :: Touchables -> Subst -> Subst
 restrictSubstitution = undefined
 
 
-simplifier :: Toplevel                     --Top-level constraints
-           -> Constraint                   --Q_Given
-           -> Touchables                   --Touchables
-           -> Constraint                   --Q_Wanted
-           -> Solver (Constraint, Subst)   --(Q_Residual; Subst)
+simplifier :: Toplevel                         -- Top-level constraints
+           -> Set Constraint                   -- Q_Given
+           -> Touchables                       -- Touchables
+           -> Set Constraint                   -- Q_Wanted
+           -> Solver (Set Constraint, Subst)   -- (Q_Residual; Subst)
 simplifier tl oldGiven oldTouch oldWanted = 
   do (newTouch, phi, newGiven, newWanted) <- rewriter tl (oldTouch, mempty, oldGiven, oldWanted)
      let (eqPart, residual) = seperateEqualities (phi `applySubst` newWanted)
