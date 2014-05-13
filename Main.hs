@@ -2,7 +2,9 @@
 
 import Prelude hiding ( )
 
+import Data.Monoid
 import Data.Foldable hiding ( msum )
+
 import Control.Monad
 import Control.Monad.State ( StateT (..) )
 import Control.Applicative
@@ -13,6 +15,7 @@ import Data.Char
 import Data.Set ( Set (..), union, isSubsetOf, intersection )
 
 import qualified Data.Set as Set
+import qualified Data.Map as Map
 
 
 -- Always associate to right? Maybe 
@@ -33,8 +36,11 @@ type Toplevel = ()
 type Touchables = Set FUV
 
 
-type Subst = ()
+data Subst = Subst (Map.Map FUV ())
 
+instance Monoid Subst where
+  mempty = Subst Map.empty
+  a `mappend` b = undefined
 
 
 dom :: Subst -> Set FUV 
@@ -95,9 +101,12 @@ instance SubstApply ImplicationConstraint where
 instance SubstApply Constraint where
   applySubst subst _ 
     = error "Substitutions on Constraints not implemented yet"
+
+release_mode :: Bool
+release_mode = False
  
 assert :: Bool -> String -> Solver ()
-assert b s = if b then return () else error s
+assert b s = if (release_mode || b) then return () else error s
  
 (#) :: Set FUV -> Set FUV -> Bool
 a # b = Set.null (a `intersection` b) 
@@ -132,14 +141,44 @@ solver tl given tch wanted = do
   --   
   return (residual, subst)
   
+type Quadruple = (Touchables, Subst, Constraint, Constraint)
   
+-- Rewrite the quadruple until no more rewrite steps are possible
+rewriter :: Toplevel -> Quadruple -> Solver Quadruple
+rewriter tl = return
+  
+-- page 66: 7.5, (2)
+seperateEqualities :: Constraint -> ( Set Constraint -- Type Equalities
+                                    , Constraint     -- Residual
+                                    )
+seperateEqualities = undefined
+
+
+
+-- page 66: 7.5, (3)
+extractSubstitution :: Set Constraint -> Subst
+extractSubstitution = undefined
+
+-- page 66: 7.5, SIMPLES
+restrictSubstitution :: Touchables -> Subst -> Subst
+restrictSubstitution = undefined
+
+
 simplifier :: Toplevel                     --Top-level constraints
            -> Constraint                   --Q_Given
            -> Touchables                   --Touchables
            -> Constraint                   --Q_Wanted
            -> Solver (Constraint, Subst)   --(Q_Residual; Subst)
-simplifier = undefined
-
+simplifier tl oldGiven oldTouch oldWanted = 
+  do (newTouch, phi, newGiven, newWanted) <- rewriter tl (oldTouch, mempty, oldGiven, oldWanted)
+     let (eqPart, residual) = seperateEqualities (phi `applySubst` newWanted)
+         theta = restrictSubstitution oldTouch . extractSubstitution $ eqPart
+         substitutedResidual = theta `applySubst` residual
+         
+     assert (dom theta `isSubsetOf` oldTouch) $ "simplifier: substitution concerns non-touchable variables" 
+     assert (dom theta # fuv substitutedResidual) $ "simplifier: domain of final substitution should be disjoint from residual"
+     
+     return $ (substitutedResidual, theta)
   
   
 
