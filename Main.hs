@@ -1,9 +1,10 @@
 {-# LANGUAGE TypeSynonymInstances, FlexibleInstances, LambdaCase #-}
 
-import Prelude hiding ( null )
+import Prelude hiding ( null, interact )
 
 import Data.Monoid
 import Data.Foldable hiding ( msum )
+import Data.Traversable
 
 import Control.Monad
 import Control.Monad.State ( StateT (..) )
@@ -161,9 +162,91 @@ solver tl given tch wanted = do
   
   --   
   return (residual, subst)
+
+disjointMerge :: Subst -> Subst -> Subst
+disjointMerge (Subst a) (Subst b) = Subst $ Map.unionWith (\a b -> {- TODO: CHECK SEMANTICS -} a) a b
+
+pick :: Int -> [a] -> [[a]]
+pick 0 _ = [[]]
+pick _ [] = []
+pick n (x : xs) = map (x :) (pick (n - 1) xs) ++ pick n xs
+
+data Role = Wanted | Given
   
 type Quadruple = (Touchables, Subst, Set Constraint, Set Constraint)
+
+
+pickFirst :: [Solver (Maybe a)] -> Solver (Maybe a) 
+pickFirst [] = return Nothing
+pickFirst (x : xs) = do r <- x
+                        case r of 
+                          Nothing -> pickFirst xs
+                          a@(Just _)  -> return a
+
+                          
+canon :: Role -> Constraint -> Solver (Maybe (Touchables, Subst, Constraint))
+canon = undefined
+                          
+-- Try to canonicalize one atomic constraint. The atomic constraints from the given/wanted 
+-- list are tried one at a time. The rule either succeeds directly after the first success
+-- or returns Nothing if all constraints are already canonic.
+                          
+ruleCanon :: Role -> Quadruple -> Solver (Maybe Quadruple)
+ruleCanon role (tch, subst, given, wanted) = pickFirst . map attempt $ choices where
+      pivot = case role of 
+                Given  -> given
+                Wanted -> wanted
   
+      choices :: [(Constraint, Set Constraint)]
+      choices = map (\[q1] -> (q1, Set.difference pivot . Set.singleton $ q1) ) . pick 1 . Set.toList $ pivot
+ 
+      attempt :: (Constraint, Set Constraint) -> Solver (Maybe Quadruple)
+      attempt (q1, rest) = flip fmap (canon role q1) $ \r ->
+        do (tch', subst', q2) <- r
+           let replaced = Set.insert q2 rest
+
+               (given', wanted') = case role of
+                                     Given  -> (replaced, wanted)
+                                     Wanted -> (given,  replaced)
+
+           return $ ( Set.union     tch   tch'
+                    , disjointMerge subst subst'
+                    , given'
+                    , wanted'
+                    )
+
+interact :: Role -> Constraint -> Constraint -> Solver (Maybe (Set Constraint))
+interact = undefined
+
+-- Generate all pairs of atomic constraints from the given/wanted list and try to let
+-- them interact one at a time. The rule either succeeds directly after the first success 
+-- or returns Nothing if no interacting pairs were found.
+ruleInteract :: Role -> Quadruple -> Solver (Maybe Quadruple)
+ruleInteract role (tch, subst, given, wanted) = pickFirst . map attempt $ choices where
+      pivot = case role of 
+                Given  -> given
+                Wanted -> wanted
+  
+      -- Generate all possible pairs of atomic constraints from the given/wanted list
+      choices :: [(Constraint, Constraint, Set Constraint)]
+      choices = map (\q@[q1, q2] -> (q1, q2, Set.difference pivot . Set.fromList $ q) ) . pick 2 . Set.toList $ pivot
+      
+      -- Let one pair interact
+      attempt :: (Constraint, Constraint, Set Constraint) -> Solver (Maybe Quadruple)
+      attempt (q1, q2, rest) = flip fmap (interact role q1 q2) $ \r -> 
+          do q3 <- r
+             let replaced = Set.union q3 rest
+
+                 (given', wanted') = case role of
+                                      Given  -> (replaced, wanted)
+                                      Wanted -> (given,  replaced)
+
+             return $ ( tch 
+                      , subst
+                      , given'
+                      , wanted'
+                      )
+
 -- Rewrite the quadruple until no more rewrite steps are possible
 rewriter :: Toplevel -> Quadruple -> Solver Quadruple
 rewriter tl = return
