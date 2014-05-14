@@ -12,8 +12,9 @@ import Control.Applicative
 
 import Text.Read
 
+import Data.Maybe
 import Data.Char
-import Data.Set ( Set (..), union, isSubsetOf, intersection )
+import Data.Set ( Set (..), union, singleton, isSubsetOf, intersection )
 
 import qualified Data.Set as Set
 import qualified Data.Map as Map
@@ -42,12 +43,12 @@ flatten :: Ord a => Set (Set a) -> Set a
 flatten = Set.unions . toList
 
 simplePart :: Set ExtendedConstraint -> Set Constraint
-simplePart m = unionMap m $ \case BaseConstraint b        -> Set.singleton b
+simplePart m = unionMap m $ \case BaseConstraint b        -> singleton b
                                   ImplicationConstraint i -> Set.empty
                                     
 implicationPart :: Set ExtendedConstraint -> Set Implication
 implicationPart m = unionMap m $ \case BaseConstraint _        -> Set.empty
-                                       ImplicationConstraint i -> Set.singleton i
+                                       ImplicationConstraint i -> singleton i
                                     
 
 type Toplevel = ()
@@ -171,12 +172,14 @@ pick 0 _ = [[]]
 pick _ [] = []
 pick n (x : xs) = map (x :) (pick (n - 1) xs) ++ pick n xs
 
-data Role = Wanted | Given
-  
+data Role 
+  = Wanted 
+  | Given
+  deriving (Eq, Show) 
 type Quadruple = (Touchables, Subst, Set Constraint, Set Constraint)
 
 
-pickFirst :: [Solver (Maybe a)] -> Solver (Maybe a) 
+pickFirst :: Monad m => [m (Maybe a)] -> m (Maybe a) 
 pickFirst [] = return Nothing
 pickFirst (x : xs) = do r <- x
                         case r of 
@@ -184,7 +187,7 @@ pickFirst (x : xs) = do r <- x
                           a@(Just _)  -> return a
 
                           
-canon :: Role -> Constraint -> Solver (Maybe (Touchables, Subst, Constraint))
+canon :: Role -> Constraint -> Solver (Maybe (Touchables, Subst, Set Constraint))
 canon = undefined
                           
 -- Try to canonicalize one atomic constraint. The atomic constraints from the given/wanted 
@@ -198,12 +201,12 @@ ruleCanon role (tch, subst, given, wanted) = pickFirst . map attempt $ choices w
                 Wanted -> wanted
   
       choices :: [(Constraint, Set Constraint)]
-      choices = map (\[q1] -> (q1, Set.difference pivot . Set.singleton $ q1) ) . pick 1 . Set.toList $ pivot
+      choices = map (\[q1] -> (q1, Set.difference pivot . singleton $ q1) ) . pick 1 . Set.toList $ pivot
  
       attempt :: (Constraint, Set Constraint) -> Solver (Maybe Quadruple)
-      attempt (q1, rest) = flip fmap (canon role q1) $ \r ->
+      attempt (q1, rest) = (`fmap` canon role q1) $ \r ->
         do (tch', subst', q2) <- r
-           let replaced = Set.insert q2 rest
+           let replaced = Set.union q2 rest
 
                (given', wanted') = case role of
                                      Given  -> (replaced, wanted)
@@ -233,7 +236,7 @@ ruleInteract role (tch, subst, given, wanted) = pickFirst . map attempt $ choice
       
       -- Let one pair interact
       attempt :: (Constraint, Constraint, Set Constraint) -> Solver (Maybe Quadruple)
-      attempt (q1, q2, rest) = flip fmap (interact role q1 q2) $ \r -> 
+      attempt (q1, q2, rest) = (`fmap` interact role q1 q2) $ \r -> 
           do q3 <- r
              let replaced = Set.union q3 rest
 
@@ -247,9 +250,79 @@ ruleInteract role (tch, subst, given, wanted) = pickFirst . map attempt $ choice
                       , wanted'
                       )
 
+topreact :: Toplevel -> Role -> Constraint -> Solver (Maybe (Touchables, Set Constraint))
+topreact = undefined
+                          
+-- Try to canonicalize one atomic constraint. The atomic constraints from the given/wanted 
+-- list are tried one at a time. The rule either succeeds directly after the first success
+-- or returns Nothing if all constraints are already canonic.
+                          
+ruleTop :: Toplevel -> Role -> Quadruple -> Solver (Maybe Quadruple)
+ruleTop tl role (tch, subst, given, wanted) = pickFirst . map attempt $ choices where
+      pivot = case role of 
+                Given  -> given
+                Wanted -> wanted
+  
+      choices :: [(Constraint, Set Constraint)]
+      choices = map (\[q1] -> (q1, Set.difference pivot . singleton $ q1) ) . pick 1 . toList $ pivot
+ 
+      attempt :: (Constraint, Set Constraint) -> Solver (Maybe Quadruple)
+      attempt (q1, rest) = (`fmap` topreact tl role q1) $ \r ->
+        do (tch', q2) <- r
+           let replaced = union q2 rest
+
+               (given', wanted') = case role of
+                                     Given  -> (replaced, wanted)
+                                     Wanted -> (given,  replaced)
+
+           if role == Given && tch' /= mempty
+              then Nothing
+              else return ( union tch tch'
+                          , subst
+                          , given'
+                          , wanted'
+                          )
+              
+simplifies :: Constraint -> Constraint -> Solver (Maybe (Set Constraint))
+simplifies = undefined
+
+-- Generate all pairs of atomic constraints from the given/wanted list and try to let
+-- them interact one at a time. The rule either succeeds directly after the first success 
+-- or returns Nothing if no interacting pairs were found.
+ruleSimplification :: Quadruple -> Solver (Maybe Quadruple)
+ruleSimplification (tch, subst, given, wanted) = pickFirst . map attempt . toList $ relevant where
+
+      relevant = given  `unionMap` \g ->
+                 wanted `unionMap` \w ->
+                 singleton $ (g, w, Set.delete w wanted)
+                 
+      attempt (g, w, wanted') = (`fmap` simplifies g w) $ \r -> 
+        do w <- r
+           return (tch, subst, given,  wanted' `union` w)   
+    
+
+                      
 -- Rewrite the quadruple until no more rewrite steps are possible
-rewriter :: Toplevel -> Quadruple -> Solver Quadruple
-rewriter tl = return
+rewriter :: Toplevel -> Quadruple -> Solver (Maybe Quadruple)
+rewriter tl quad =
+  let  rules = [ ruleCanon Given
+          , ruleCanon Wanted
+          , ruleInteract Given
+          , ruleInteract Wanted
+          , ruleSimplification
+          , ruleTop tl Given
+          , ruleTop tl Wanted
+          ]
+       go q = do fired <- pickFirst $ map ($ q) rules
+                 case fired of
+                      Nothing -> return $ Just q
+                      Just q' -> go q'
+                     
+  in do fired <- pickFirst $ map ($ quad) rules
+        case fired of
+             Nothing  -> return Nothing
+             Just q'  -> go q'
+          
   
 -- page 66: 7.5, (2)
 seperateEqualities :: Set Constraint -> ( Set Equality    -- Type Equalities
@@ -274,7 +347,10 @@ simplifier :: Toplevel                         -- Top-level constraints
            -> Set Constraint                   -- Q_Wanted
            -> Solver (Set Constraint, Subst)   -- (Q_Residual; Subst)
 simplifier tl oldGiven oldTouch oldWanted = 
-  do (newTouch, phi, newGiven, newWanted) <- rewriter tl (oldTouch, mempty, oldGiven, oldWanted)
+  do let rewriter' tl q = fmap (fromMaybe q) (rewriter tl q) 
+    
+     (newTouch, phi, newGiven, newWanted) <- rewriter' tl (oldTouch, mempty, oldGiven, oldWanted)
+     
      let (eqPart, residual) = seperateEqualities (phi `applySubst` newWanted)
          theta = restrictSubstitution oldTouch . extractSubstitution $ eqPart
          substitutedResidual = theta `applySubst` residual
