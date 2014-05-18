@@ -1,3 +1,5 @@
+-- (C) W.L. Elsinghorst 2014, All Rights Reserved. 
+
 {-# LANGUAGE TypeSynonymInstances, FlexibleInstances, LambdaCase #-}
 
 import Prelude hiding ( null, interact )
@@ -19,12 +21,31 @@ import Data.Set ( Set (..), union, singleton, isSubsetOf, intersection )
 import qualified Data.Set as Set
 import qualified Data.Map as Map
 
-data Equality = Equality
+data TypeVariable 
+  = UnificationVariable FUV
+  | SkolemVariable
+  deriving (Eq, Ord)
+  
+
+data Monotype 
+  = TyVar TypeVariable
+  | TyCon String [Monotype]
+  | TyFam String [Monotype]
+  | ConcreteType String 
+
+  deriving (Eq)
+
+-- fig 20 page 58
+instance Ord Monotype where
+  compare = undefined
+  
+  
+data Equality = (:~) Monotype Monotype
   deriving (Eq, Ord)
    
 data Constraint 
-  = EqualityConstraint Equality 
-  | TypeclassConstraint
+  = Equality Equality 
+  | TypeClass String [Monotype]
   deriving (Eq, Ord)
 
 data Implication 
@@ -55,7 +76,7 @@ type Toplevel = ()
 type Touchables = Set FUV
 
 
-data Subst = Subst (Map.Map FUV ())
+data Subst = Subst (Map.Map FUV Monotype)
 
 instance Monoid Subst where
   mempty = Subst Map.empty
@@ -135,8 +156,8 @@ assert b s = if (release_mode || b) then return () else error s
 a # b = Set.null (a `intersection` b) 
  
 
-free :: Solver FUV
-free = StateT $ \fuv -> Value (fuv, succ fuv)
+fresh :: Solver FUV
+fresh = StateT $ \fuv -> Value (fuv, succ fuv)
  
 solver :: Toplevel                    --Top-level constraints
        -> Set Constraint              --Q_Given
@@ -180,16 +201,58 @@ type Quadruple = (Touchables, Subst, Set Constraint, Set Constraint)
 
 
 pickFirst :: Monad m => [m (Maybe a)] -> m (Maybe a) 
-pickFirst [] = return Nothing
-pickFirst (x : xs) = do r <- x
-                        case r of 
-                          Nothing -> pickFirst xs
-                          a@(Just _)  -> return a
+pickFirst []     = return Nothing
+pickFirst (x:xs) = do r <- x
+                      case r of 
+                        Nothing     -> pickFirst xs
+                        a@(Just _)  -> return a
 
-                          
+noTypeFamilies :: Monotype -> Bool
+noTypeFamilies = undefined
+
+occurs :: TypeVariable -> Monotype -> Bool
+occurs = undefined
+    
+magic :: Maybe Int -> Int
+magic r | Just a <- r = a
+magic r | otherwise = 0
+    
+substFromList :: [(FUV, Monotype)] -> Subst
+substFromList = Subst . Map.fromList
+   
 canon :: Role -> Constraint -> Solver (Maybe (Touchables, Subst, Set Constraint))
-canon = undefined
-                          
+canon role (Equality ec) = canonEquality ec where
+  canonEquality :: Equality -> Solver (Maybe (Touchables, Subst, Set Constraint))
+  canonEquality (a :~ b)                               |   a == b   = return $ Just (Set.empty, mempty, Set.empty)
+  canonEquality ( (TyCon nm1 ty1) :~ (TyCon nm2 ty2) ) | nm1 == nm2 = return $ Just (Set.empty, mempty, Set.fromList . map Equality $ zipWith (:~) ty1 ty2)
+  canonEquality ( (TyCon nm1 ty1) :~ (TyCon nm2 ty2) ) | nm1 /= nm2 = fail $ "canon: cannot solve equality between different type constructors" 
+  canonEquality ( (TyVar tv) :~ typ ) | noTypeFamilies typ && occurs tv typ = fail $ "canon: failed occurs check" 
+  canonEquality (a :~ b)                               |   b < a    = return $ Just (Set.empty, mempty, singleton . Equality $ b :~ a)
+canon role (TypeClass nm ts) = 
+  do w <- flatten ts
+     return $ do (ts', s@(beta, mt)) <- w
+     
+                 let wrappedBeta = TyVar (UnificationVariable beta)
+     
+                 let (tch, subst) = case role of
+                                         Given  -> (singleton beta, mempty)
+                                         Wanted -> (Set.empty, substFromList [s])
+     
+                 return (tch, subst, Set.fromList $ [(TypeClass nm ts'), Equality (mt :~ wrappedBeta)]) 
+  where
+    flatten :: [Monotype] -> Solver (Maybe ([Monotype], (FUV, Monotype)))
+    flatten []                     = return $ Nothing
+    flatten (r@(TyFam nm ts) : rs) = do beta <- fresh
+                                        let wrappedBeta = TyVar (UnificationVariable beta)
+                                        return $ Just (wrappedBeta : rs, (beta, r)) 
+    flatten (r : rs) = do w <- flatten rs
+                          return $ do (rs', s) <- w
+                                      return $ (r : rs', s)
+                         
+                                  
+  
+ 
+                         
 -- Try to canonicalize one atomic constraint. The atomic constraints from the given/wanted 
 -- list are tried one at a time. The rule either succeeds directly after the first success
 -- or returns Nothing if all constraints are already canonic.
@@ -302,17 +365,18 @@ ruleSimplification (tch, subst, given, wanted) = pickFirst . map attempt . toLis
     
 
                       
--- Rewrite the quadruple until no more rewrite steps are possible
+-- Rewrite the quadruple until no more rewrite steps are possible. Returns Nothing
+-- if no rewrite was applicable.
 rewriter :: Toplevel -> Quadruple -> Solver (Maybe Quadruple)
 rewriter tl quad =
   let  rules = [ ruleCanon Given
-          , ruleCanon Wanted
-          , ruleInteract Given
-          , ruleInteract Wanted
-          , ruleSimplification
-          , ruleTop tl Given
-          , ruleTop tl Wanted
-          ]
+               , ruleCanon Wanted
+               , ruleInteract Given
+               , ruleInteract Wanted
+               , ruleSimplification
+               , ruleTop tl Given
+               , ruleTop tl Wanted
+               ]
        go q = do fired <- pickFirst $ map ($ q) rules
                  case fired of
                       Nothing -> return $ Just q
