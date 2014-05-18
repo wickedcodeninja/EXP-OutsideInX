@@ -215,13 +215,25 @@ occurs = undefined
       
 substFromList :: [(FUV, Monotype)] -> Subst
 substFromList = Subst . Map.fromList
-  
+
+isTypeFamily :: Monotype -> Bool
+isTypeFamily (TyFam _ _) = True
+isTypeFamily _           = False
+
+isTypeVariable :: Monotype -> Bool
+isTypeVariable (TyVar _) = True
+isTypeVariable _         = False
+
 extractTypeFamily :: [Monotype] -> Maybe (Monotype -> [Monotype], Monotype)
 extractTypeFamily []     = Nothing 
 extractTypeFamily ( r@(TyFam nm ts) : xs ) = Just (\x -> x : xs, r)
 extractTypeFamily ( r               : xs ) = case extractTypeFamily xs of
                                                   Just (f, t) -> Just (\x -> r : f x, t)
                                                   Nothing     -> Nothing
+                                                  
+extractRelevant :: Monotype -> Maybe ( [Monotype] -> Monotype, [Monotype] )
+extractRelevant (TyFam nm ts) = Just (\ts' -> TyFam nm ts', ts)
+                                                  
 canon :: Role -> Constraint -> Solver (Maybe (Touchables, Subst, Set Constraint))
 canon role (Equality ec) = canonEquality ec where
   canonEquality :: Equality -> Solver (Maybe (Touchables, Subst, Set Constraint))
@@ -230,7 +242,8 @@ canon role (Equality ec) = canonEquality ec where
   canonEquality ( (TyCon nm1 ty1) :~ (TyCon nm2 ty2) ) | nm1 /= nm2 = fail $ "canon: cannot solve equality between different type constructors" 
   canonEquality ( (TyVar tv) :~ typ ) | noTypeFamilies typ && occurs tv typ = fail $ "canon: failed occurs check" 
   canonEquality (a :~ b)                               |   b < a    = return $ Just (Set.empty, mempty, singleton . Equality $ b :~ a)
-  canonEquality ( (TyFam nm ts) :~ typ ) | and (map noTypeFamilies ts), Just (f, r) <- extractTypeFamily ts =
+  canonEquality ( (TyFam nm ts) :~ typ ) | and (map noTypeFamilies ts)
+                                         , Just (reconstructTypeFamily, r) <- extractTypeFamily ts =
     do beta <- fresh
 
        let wrappedBeta = TyVar (UnificationVariable beta)
@@ -239,8 +252,23 @@ canon role (Equality ec) = canonEquality ec where
                                Given  -> (singleton beta, mempty)
                                Wanted -> (Set.empty, substFromList [(beta, r)])
      
-       return $ Just (tch, subst, Set.fromList $ [Equality $ TyFam nm (f wrappedBeta) :~ typ, Equality (r :~ wrappedBeta)]) 
-canon role (TypeClass nm ts) | and (map noTypeFamilies ts), Just (f, r) <- extractTypeFamily ts =
+       return $ Just (tch, subst, Set.fromList $ [Equality $ TyFam nm (reconstructTypeFamily wrappedBeta) :~ typ, Equality (r :~ wrappedBeta)]) 
+  canonEquality ( typ :~ rhs ) | Just (reconstructRelevant, ts) <- extractRelevant rhs
+                               , isTypeFamily typ || isTypeVariable typ
+                               , and (map noTypeFamilies ts)
+                               , Just (reconstructTypeFamily, r) <- extractTypeFamily ts = 
+    do beta <- fresh
+    
+       let wrappedBeta = TyVar (UnificationVariable beta)
+         
+           (tch, subst) = case role of
+                               Given  -> (singleton beta, mempty)
+                               Wanted -> (Set.empty, substFromList [(beta, r)])                      
+ 
+       return $ Just (tch, subst, Set.fromList $ [Equality $ typ :~ reconstructRelevant (reconstructTypeFamily wrappedBeta), Equality (r :~ wrappedBeta)])
+       
+canon role (TypeClass nm ts) | and (map noTypeFamilies ts)
+                             , Just (reconstructTypeFamily, r) <- extractTypeFamily ts =
   do beta <- fresh
 
      let wrappedBeta = TyVar (UnificationVariable beta)
@@ -249,7 +277,7 @@ canon role (TypeClass nm ts) | and (map noTypeFamilies ts), Just (f, r) <- extra
                              Given  -> (singleton beta, mempty)
                              Wanted -> (Set.empty, substFromList [(beta, r)])
      
-     return $ Just (tch, subst, Set.fromList $ [TypeClass nm (f wrappedBeta), Equality (r :~ wrappedBeta)])
+     return $ Just (tch, subst, Set.fromList $ [TypeClass nm (reconstructTypeFamily wrappedBeta), Equality (r :~ wrappedBeta)])
          
   
  
