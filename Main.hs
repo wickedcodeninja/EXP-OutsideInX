@@ -5,7 +5,7 @@
 import Prelude hiding ( null, interact )
 
 import Data.Monoid
-import Data.Foldable hiding ( msum )
+import Data.Foldable hiding ( msum, and )
 import Data.Traversable
 
 import Control.Monad
@@ -212,14 +212,16 @@ noTypeFamilies = undefined
 
 occurs :: TypeVariable -> Monotype -> Bool
 occurs = undefined
-    
-magic :: Maybe Int -> Int
-magic r | Just a <- r = a
-magic r | otherwise = 0
-    
+      
 substFromList :: [(FUV, Monotype)] -> Subst
 substFromList = Subst . Map.fromList
-   
+  
+extractTypeFamily :: [Monotype] -> Maybe (Monotype -> [Monotype], Monotype)
+extractTypeFamily []     = Nothing 
+extractTypeFamily ( r@(TyFam nm ts) : xs ) = Just (\x -> x : xs, r)
+extractTypeFamily ( r               : xs ) = case extractTypeFamily xs of
+                                                  Just (f, t) -> Just (\x -> r : f x, t)
+                                                  Nothing     -> Nothing
 canon :: Role -> Constraint -> Solver (Maybe (Touchables, Subst, Set Constraint))
 canon role (Equality ec) = canonEquality ec where
   canonEquality :: Equality -> Solver (Maybe (Touchables, Subst, Set Constraint))
@@ -228,28 +230,27 @@ canon role (Equality ec) = canonEquality ec where
   canonEquality ( (TyCon nm1 ty1) :~ (TyCon nm2 ty2) ) | nm1 /= nm2 = fail $ "canon: cannot solve equality between different type constructors" 
   canonEquality ( (TyVar tv) :~ typ ) | noTypeFamilies typ && occurs tv typ = fail $ "canon: failed occurs check" 
   canonEquality (a :~ b)                               |   b < a    = return $ Just (Set.empty, mempty, singleton . Equality $ b :~ a)
-canon role (TypeClass nm ts) = 
-  do w <- flatten ts
-     return $ do (ts', s@(beta, mt)) <- w
+  canonEquality ( (TyFam nm ts) :~ typ ) | and (map noTypeFamilies ts), Just (f, r) <- extractTypeFamily ts =
+    do beta <- fresh
+
+       let wrappedBeta = TyVar (UnificationVariable beta)
+         
+           (tch, subst) = case role of
+                               Given  -> (singleton beta, mempty)
+                               Wanted -> (Set.empty, substFromList [(beta, r)])
      
-                 let wrappedBeta = TyVar (UnificationVariable beta)
+       return $ Just (tch, subst, Set.fromList $ [Equality $ TyFam nm (f wrappedBeta) :~ typ, Equality (r :~ wrappedBeta)]) 
+canon role (TypeClass nm ts) | and (map noTypeFamilies ts), Just (f, r) <- extractTypeFamily ts =
+  do beta <- fresh
+
+     let wrappedBeta = TyVar (UnificationVariable beta)
+         
+         (tch, subst) = case role of
+                             Given  -> (singleton beta, mempty)
+                             Wanted -> (Set.empty, substFromList [(beta, r)])
      
-                 let (tch, subst) = case role of
-                                         Given  -> (singleton beta, mempty)
-                                         Wanted -> (Set.empty, substFromList [s])
-     
-                 return (tch, subst, Set.fromList $ [(TypeClass nm ts'), Equality (mt :~ wrappedBeta)]) 
-  where
-    flatten :: [Monotype] -> Solver (Maybe ([Monotype], (FUV, Monotype)))
-    flatten []                     = return $ Nothing
-    flatten (r@(TyFam nm ts) : rs) = do beta <- fresh
-                                        let wrappedBeta = TyVar (UnificationVariable beta)
-                                        return $ Just (wrappedBeta : rs, (beta, r)) 
-    flatten (r : rs) = do w <- flatten rs
-                          return $ do (rs', s) <- w
-                                      return $ (r : rs', s)
-                         
-                                  
+     return $ Just (tch, subst, Set.fromList $ [TypeClass nm (f wrappedBeta), Equality (r :~ wrappedBeta)])
+         
   
  
                          
