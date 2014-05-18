@@ -233,7 +233,12 @@ extractTypeFamily ( r               : xs ) = case extractTypeFamily xs of
                                                   
 extractRelevant :: Monotype -> Maybe ( [Monotype] -> Monotype, [Monotype] )
 extractRelevant (TyFam nm ts) = Just (\ts' -> TyFam nm ts', ts)
-                                                  
+extractRelevant (TyCon nm ts) = Just (\ts' -> TyCon nm ts', ts)
+extractRelevant _             = Nothing
+-- NOTE: TT := T TT | F | TT -> TT | tv | hole
+--       Not sure how these other cases could arise?
+
+
 canon :: Role -> Constraint -> Solver (Maybe (Touchables, Subst, Set Constraint))
 canon role (Equality ec) = canonEquality ec where
   canonEquality :: Equality -> Solver (Maybe (Touchables, Subst, Set Constraint))
