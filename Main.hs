@@ -5,7 +5,7 @@
 import Prelude hiding ( null, interact )
 
 import Data.Monoid
-import Data.Foldable hiding ( msum, and )
+import Data.Foldable hiding ( msum, and, or )
 import Data.Traversable
 
 import Control.Monad
@@ -139,6 +139,9 @@ instance SubstApply Implication where
   applySubst subst (Implication c e tch) -- assert tch # fuv(subst) ?
     = Implication (applySubst subst c) (applySubst subst e) tch
 
+instance SubstApply Monotype where
+  applySubst subst _ = undefined
+    
 instance SubstApply Constraint where
   applySubst subst _ 
     = error "Substitutions on Constraints not implemented yet"
@@ -207,8 +210,8 @@ pickFirst (x:xs) = do r <- x
                         Nothing     -> pickFirst xs
                         a@(Just _)  -> return a
 
-noTypeFamilies :: Monotype -> Bool
-noTypeFamilies = undefined
+isTypeFamilyFree :: Monotype -> Bool
+isTypeFamilyFree = undefined
 
 occurs :: TypeVariable -> Monotype -> Bool
 occurs = undefined
@@ -245,10 +248,11 @@ canon role (Equality ec) = canonEquality ec where
   canonEquality (a :~ b)                               |   a == b   = return $ Just (Set.empty, mempty, Set.empty)
   canonEquality ( (TyCon nm1 ty1) :~ (TyCon nm2 ty2) ) | nm1 == nm2 = return $ Just (Set.empty, mempty, Set.fromList . map Equality $ zipWith (:~) ty1 ty2)
   canonEquality ( (TyCon nm1 ty1) :~ (TyCon nm2 ty2) ) | nm1 /= nm2 = fail $ "canon: cannot solve equality between different type constructors" 
-  canonEquality ( (TyVar tv) :~ typ ) | noTypeFamilies typ && occurs tv typ = fail $ "canon: failed occurs check" 
+  canonEquality ( (TyVar tv) :~ typ ) | isTypeFamilyFree typ && occurs tv typ = fail $ "canon: failed occurs check" 
   canonEquality (a :~ b)                               |   b < a    = return $ Just (Set.empty, mempty, singleton . Equality $ b :~ a)
-  canonEquality ( (TyFam nm ts) :~ typ ) | and (map noTypeFamilies ts)
-                                         , Just (reconstructTypeFamily, r) <- extractTypeFamily ts =
+  canonEquality ( (TyFam nm ts) :~ typ ) | and (map isTypeFamilyFree ts)
+                                         , Just (reconstructTypeFamily, r) <- extractTypeFamily ts
+                                         =
     do beta <- fresh
 
        let wrappedBeta = TyVar (UnificationVariable beta)
@@ -260,8 +264,9 @@ canon role (Equality ec) = canonEquality ec where
        return $ Just (tch, subst, Set.fromList $ [Equality $ TyFam nm (reconstructTypeFamily wrappedBeta) :~ typ, Equality (r :~ wrappedBeta)]) 
   canonEquality ( typ :~ rhs ) | Just (reconstructRelevant, ts) <- extractRelevant rhs
                                , isTypeFamily typ || isTypeVariable typ
-                               , and (map noTypeFamilies ts)
-                               , Just (reconstructTypeFamily, r) <- extractTypeFamily ts = 
+                               , and (map isTypeFamilyFree ts)
+                               , Just (reconstructTypeFamily, r) <- extractTypeFamily ts 
+                               = 
     do beta <- fresh
     
        let wrappedBeta = TyVar (UnificationVariable beta)
@@ -272,8 +277,9 @@ canon role (Equality ec) = canonEquality ec where
  
        return $ Just (tch, subst, Set.fromList $ [Equality $ typ :~ reconstructRelevant (reconstructTypeFamily wrappedBeta), Equality (r :~ wrappedBeta)])
        
-canon role (TypeClass nm ts) | and (map noTypeFamilies ts)
-                             , Just (reconstructTypeFamily, r) <- extractTypeFamily ts =
+canon role (TypeClass nm ts) | and (map isTypeFamilyFree ts)
+                             , Just (reconstructTypeFamily, r) <- extractTypeFamily ts
+                             =
   do beta <- fresh
 
      let wrappedBeta = TyVar (UnificationVariable beta)
@@ -283,7 +289,7 @@ canon role (TypeClass nm ts) | and (map noTypeFamilies ts)
                              Wanted -> (Set.empty, substFromList [(beta, r)])
      
      return $ Just (tch, subst, Set.fromList $ [TypeClass nm (reconstructTypeFamily wrappedBeta), Equality (r :~ wrappedBeta)])
-         
+canon role _ = return Nothing       
   
  
                          
@@ -315,9 +321,56 @@ ruleCanon role (tch, subst, given, wanted) = pickFirst . map attempt $ choices w
                     , wanted'
                     )
 
-interact :: Role -> Constraint -> Constraint -> Solver (Maybe (Set Constraint))
-interact = undefined
-
+isCanonical :: Constraint -> Bool
+isCanonical (Equality ( r@(TyVar a) :~ t))   | isTypeFamilyFree t && r < t && not (occurs a t) = True
+isCanonical (Equality ( r@(TyFam _ _) :~ t)) | isTypeFamilyFree r            = True
+isCanonical (TypeClass nm ts)                | and (map isTypeFamilyFree ts) = True
+isCanonical _ = False
+ 
+ 
+interact :: Constraint -> Constraint -> Solver (Maybe (Set Constraint))
+interact x@(Equality (TyVar va :~ a)) (TypeClass nm bs) | isCanonical x
+                                                        , or (map (occurs va) bs)
+                                                        , UnificationVariable uva <- va
+                                                        = return . Just . Set.fromList $ 
+                                                            [ x
+                                                            , TypeClass nm (map (applySubst $ substFromList [(uva, a)]) bs)
+                                                            ]
+interact x@(TypeClass nma as) y@(TypeClass nmb bs) | x == y 
+                                                   = return $ Just . singleton $ x
+interact (Equality a) (Equality b) = fmap (fmap (Set.map Equality)) (interactEquality a b) where
+  interactEquality :: Equality -> Equality -> Solver (Maybe (Set Equality))
+  interactEquality x@(TyVar va :~ a) y@(TyVar vb :~ b) | va == vb
+                                                       , isCanonical (Equality x), isTypeFamilyFree a
+                                                       , isCanonical (Equality y), isTypeFamilyFree b
+                                                       = return . Just . Set.fromList $ 
+                                                           [ x
+                                                           , a :~ b 
+                                                           ]
+  interactEquality x@(TyVar va :~ a) y@(TyVar vb :~ b)  | isCanonical (Equality x), isTypeFamilyFree a
+                                                        , isCanonical (Equality y), isTypeFamilyFree b
+                                                        , occurs va b
+                                                        , UnificationVariable uva <- va
+                                                        = return . Just . Set.fromList $
+                                                            [ x
+                                                            , TyVar vb :~ applySubst (substFromList [(uva, a)]) b
+                                                            ]
+  interactEquality x@(TyVar va :~ a) y@(TyFam nm ts :~ b)  | isCanonical (Equality x), isTypeFamilyFree a
+                                                           ,                           isTypeFamilyFree b
+                                                           , occurs va b || or (map (occurs va) ts)
+                                                           , UnificationVariable uva <- va
+                                                           = return . Just . Set.fromList $
+                                                             [ x
+                                                             , TyFam nm (map (applySubst $ substFromList [(uva, a)]) ts)
+                                                                 :~ applySubst (substFromList [(uva, a)]) b
+                                                             ]
+  interactEquality x@(TyFam nma tsa :~ a) y@(TyFam nmb tsb :~ b) | nma == nmb
+                                                                 , tsa == tsb
+                                                                 = return . Just . Set.fromList  $
+                                                                     [ x
+                                                                     , a :~ b
+                                                                     ]
+interact _ _ = return $ Nothing
 -- Generate all pairs of atomic constraints from the given/wanted list and try to let
 -- them interact one at a time. The rule either succeeds directly after the first success 
 -- or returns Nothing if no interacting pairs were found.
@@ -333,7 +386,7 @@ ruleInteract role (tch, subst, given, wanted) = pickFirst . map attempt $ choice
       
       -- Let one pair interact
       attempt :: (Constraint, Constraint, Set Constraint) -> Solver (Maybe Quadruple)
-      attempt (q1, q2, rest) = (`fmap` interact role q1 q2) $ \r -> 
+      attempt (q1, q2, rest) = (`fmap` interact q1 q2) $ \r -> 
           do q3 <- r
              let replaced = Set.union q3 rest
 
