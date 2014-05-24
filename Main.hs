@@ -330,6 +330,7 @@ isCanonical _ = False
  
 interact :: Constraint -> Constraint -> Solver (Maybe (Set Constraint))
 interact x@(Equality (TyVar va :~ a)) (TypeClass nm bs) | isCanonical x
+                                                        , and (map isTypeFamilyFree bs)
                                                         , or (map (occurs va) bs)
                                                         , UnificationVariable uva <- va
                                                         = return . Just . Set.fromList $ 
@@ -341,22 +342,22 @@ interact x@(TypeClass nma as) y@(TypeClass nmb bs) | x == y
 interact (Equality a) (Equality b) = fmap (fmap (Set.map Equality)) (interactEquality a b) where
   interactEquality :: Equality -> Equality -> Solver (Maybe (Set Equality))
   interactEquality x@(TyVar va :~ a) y@(TyVar vb :~ b) | va == vb
-                                                       , isCanonical (Equality x), isTypeFamilyFree a
-                                                       , isCanonical (Equality y), isTypeFamilyFree b
+                                                       , isCanonical (Equality x)
+                                                       , isCanonical (Equality y)
                                                        = return . Just . Set.fromList $ 
                                                            [ x
                                                            , a :~ b 
                                                            ]
-  interactEquality x@(TyVar va :~ a) y@(TyVar vb :~ b)  | isCanonical (Equality x), isTypeFamilyFree a
-                                                        , isCanonical (Equality y), isTypeFamilyFree b
+  interactEquality x@(TyVar va :~ a) y@(TyVar vb :~ b)  | isCanonical (Equality x)
+                                                        , isCanonical (Equality y)
                                                         , occurs va b
                                                         , UnificationVariable uva <- va
                                                         = return . Just . Set.fromList $
                                                             [ x
                                                             , TyVar vb :~ applySubst (substFromList [(uva, a)]) b
                                                             ]
-  interactEquality x@(TyVar va :~ a) y@(TyFam nm ts :~ b)  | isCanonical (Equality x), isTypeFamilyFree a
-                                                           ,                           isTypeFamilyFree b
+  interactEquality x@(TyVar va :~ a) y@(TyFam nm ts :~ b)  | isCanonical (Equality x)
+                                                           , isTypeFamilyFree b && and (map isTypeFamilyFree ts)
                                                            , occurs va b || or (map (occurs va) ts)
                                                            , UnificationVariable uva <- va
                                                            = return . Just . Set.fromList $
@@ -370,6 +371,8 @@ interact (Equality a) (Equality b) = fmap (fmap (Set.map Equality)) (interactEqu
                                                                      [ x
                                                                      , a :~ b
                                                                      ]
+  -- Missing RULE in figure 22??? 
+  --   Fx ~ x `interact` tv ~ y (which is missing from simplifier)
 interact _ _ = return $ Nothing
 -- Generate all pairs of atomic constraints from the given/wanted list and try to let
 -- them interact one at a time. The rule either succeeds directly after the first success 
@@ -400,6 +403,58 @@ ruleInteract role (tch, subst, given, wanted) = pickFirst . map attempt $ choice
                       , wanted'
                       )
 
+simplifies :: Constraint -> Constraint -> Solver (Maybe (Set Constraint))
+simplifies x@(Equality (TyVar va :~ a)) (TypeClass nm bs) | isCanonical x
+                                                          , and (map isTypeFamilyFree bs)
+                                                          , or (map (occurs va) bs)
+                                                          , UnificationVariable uva <- va
+                                                          = return . Just . Set.fromList $ 
+                                                              [ TypeClass nm (map (applySubst $ substFromList [(uva, a)]) bs)
+                                                              ]
+simplifies x@(TypeClass nma as) y@(TypeClass nmb bs) | x == y 
+                                                     = return $ Just Set.empty
+simplifies (Equality a) (Equality b) = fmap (fmap (Set.map Equality)) (simplifiesEquality a b) where
+  simplifiesEquality :: Equality -> Equality -> Solver (Maybe (Set Equality))
+  simplifiesEquality x@(TyVar va :~ a) y@(TyVar vb :~ b) | va == vb
+                                                         , isCanonical (Equality x)
+                                                         = return . Just . Set.fromList $ 
+                                                             [ a :~ b 
+                                                             ]
+  simplifiesEquality x@(TyVar va :~ a) y@(TyVar vb :~ b)  | isCanonical (Equality x)
+                                                          , occurs va b
+                                                          , UnificationVariable uva <- va
+                                                          = return . Just . Set.fromList $
+                                                              [ TyVar vb :~ applySubst (substFromList [(uva, a)]) b
+                                                              ]
+  simplifiesEquality x@(TyVar va :~ a) y@(TyFam nm ts :~ b)  | isCanonical (Equality x)
+                                                             , isTypeFamilyFree b && and (map isTypeFamilyFree ts)
+                                                             , or (map (occurs va) ts)
+                                                             , UnificationVariable uva <- va
+                                                             = return . Just . Set.fromList $
+                                                               [ TyFam nm (map (applySubst $ substFromList [(uva, a)]) ts) :~ b
+                                                               ]
+  simplifiesEquality x@(TyFam nma tsa :~ a) y@(TyFam nmb tsb :~ b) | nma == nmb
+                                                                   , tsa == tsb
+                                                                   = return . Just . Set.fromList  $
+                                                                       [ a :~ b
+                                                                       ]
+simplifies _ _ = return $ Nothing
+
+-- Generate all pairs of atomic constraints from the given/wanted list and try to let
+-- them interact one at a time. The rule either succeeds directly after the first success 
+-- or returns Nothing if no interacting pairs were found.
+ruleSimplification :: Quadruple -> Solver (Maybe Quadruple)
+ruleSimplification (tch, subst, given, wanted) = pickFirst . map attempt . toList $ relevant where
+
+      relevant = given  `unionMap` \g ->
+                 wanted `unionMap` \w ->
+                 singleton $ (g, w, Set.delete w wanted)
+                 
+      attempt (g, w, wanted') = (`fmap` simplifies g w) $ \r -> 
+        do w <- r
+           return (tch, subst, given,  wanted' `union` w)   
+    
+                      
 topreact :: Toplevel -> Role -> Constraint -> Solver (Maybe (Touchables, Set Constraint))
 topreact = undefined
                           
@@ -432,24 +487,6 @@ ruleTop tl role (tch, subst, given, wanted) = pickFirst . map attempt $ choices 
                           , given'
                           , wanted'
                           )
-              
-simplifies :: Constraint -> Constraint -> Solver (Maybe (Set Constraint))
-simplifies = undefined
-
--- Generate all pairs of atomic constraints from the given/wanted list and try to let
--- them interact one at a time. The rule either succeeds directly after the first success 
--- or returns Nothing if no interacting pairs were found.
-ruleSimplification :: Quadruple -> Solver (Maybe Quadruple)
-ruleSimplification (tch, subst, given, wanted) = pickFirst . map attempt . toList $ relevant where
-
-      relevant = given  `unionMap` \g ->
-                 wanted `unionMap` \w ->
-                 singleton $ (g, w, Set.delete w wanted)
-                 
-      attempt (g, w, wanted') = (`fmap` simplifies g w) $ \r -> 
-        do w <- r
-           return (tch, subst, given,  wanted' `union` w)   
-    
 
                       
 -- Rewrite the quadruple until no more rewrite steps are possible. Returns Nothing
