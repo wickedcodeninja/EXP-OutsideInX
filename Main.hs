@@ -80,11 +80,11 @@ data Subst = Subst (Map.Map FUV Monotype)
 
 instance Monoid Subst where
   mempty = Subst Map.empty
-  a `mappend` b = undefined
+  x@(Subst a) `mappend` y@(Subst b) = Subst $ Map.unionWith (flip const) a (Map.map (applySubst x) b)
 
 
 dom :: Subst -> Set FUV 
-dom = undefined  
+dom (Subst s) = Set.fromList . Map.keys $ s 
   
 fuv :: Set Constraint -> Set FUV
 fuv = undefined
