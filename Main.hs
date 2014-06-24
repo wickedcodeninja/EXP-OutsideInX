@@ -6,7 +6,7 @@ import Prelude hiding ( null, interact )
 
 import Data.Monoid
 import Data.Foldable hiding ( msum, and, or )
-import Data.Traversable
+import Data.Traversable ( traverse )
 
 import Control.Monad
 import Control.Monad.State ( StateT (..) )
@@ -16,14 +16,14 @@ import Text.Read
 
 import Data.Maybe
 import Data.Char
-import Data.Set ( Set (..), union, singleton, isSubsetOf, intersection )
+import Data.Set ( Set (..), union, singleton, difference, isSubsetOf, intersection )
 
 import qualified Data.Set as Set
 import qualified Data.Map as Map
 
 data TypeVariable 
   = UnificationVariable FUV
-  | SkolemVariable
+  | SkolemVariable -- where do we need this?
   deriving (Eq, Ord)
   
 
@@ -56,26 +56,29 @@ data ExtendedConstraint
   = BaseConstraint Constraint 
   | ImplicationConstraint Implication
   deriving (Eq, Ord)
+  
+data Toplevel 
+  = TopBasic Constraint
+  | TopTyFam String [([Monotype], Monotype)] -- F V ~ v. List of ordered equations for closed type families.
+                                      
+  | TopClass String Constraint [Monotype]    -- Q => D V
 
-unionMap :: (Ord a, Ord b) => Set a -> (a -> Set b) -> Set b
-unionMap m f = flatten (Set.map f m)
+  
+unionBind :: (Ord a, Ord b) => Set a -> (a -> Set b) -> Set b
+unionBind m f = flatten (Set.map f m)
 
 flatten :: Ord a => Set (Set a) -> Set a
 flatten = Set.unions . toList
 
 simplePart :: Set ExtendedConstraint -> Set Constraint
-simplePart m = unionMap m $ \case BaseConstraint b        -> singleton b
-                                  ImplicationConstraint i -> Set.empty
+simplePart m = m `unionBind` \case BaseConstraint b        -> singleton b
+                                   ImplicationConstraint i -> Set.empty
                                     
 implicationPart :: Set ExtendedConstraint -> Set Implication
-implicationPart m = unionMap m $ \case BaseConstraint _        -> Set.empty
-                                       ImplicationConstraint i -> singleton i
+implicationPart m = m `unionBind` \case BaseConstraint _        -> Set.empty
+                                        ImplicationConstraint i -> singleton i
                                     
 
-data Toplevel 
-  = TopBasic Constraint
-  | TopTyFam            (String, [Monotype]) Monotype -- F V ~ v
-  | TopClass Constraint (String, [Monotype])          -- Q => D V
 
 type Touchables = Set FUV
 
@@ -90,9 +93,18 @@ instance Monoid Subst where
 dom :: Subst -> Set FUV 
 dom (Subst s) = Set.fromList . Map.keys $ s 
   
-fuv :: Set Constraint -> Set FUV
-fuv = undefined
+class OverloadedFUV a where
+  fuv :: a -> Set FUV
+  
  
+instance OverloadedFUV (Set Constraint) where
+  fuv = undefined
+instance OverloadedFUV Monotype where
+  fuv = undefined 
+instance OverloadedFUV [Monotype] where
+  fuv = undefined 
+  
+  
 
 data FUV = FUV String
   deriving (Show, Eq)
@@ -166,7 +178,7 @@ a # b = Set.null (a `intersection` b)
 fresh :: Solver FUV
 fresh = StateT $ \fuv -> Value (fuv, succ fuv)
  
-solver :: Toplevel                    --Top-level constraints
+solver :: Set Toplevel                --Top-level constraints
        -> Set Constraint              --Q_Given
        -> Touchables                  --Touchables
        -> Set ExtendedConstraint      --C_Wanted                
@@ -450,8 +462,8 @@ simplifies _ _ = return $ Nothing
 ruleSimplification :: Quadruple -> Solver (Maybe Quadruple)
 ruleSimplification (tch, subst, given, wanted) = pickFirst . map attempt . toList $ relevant where
 
-      relevant = given  `unionMap` \g ->
-                 wanted `unionMap` \w ->
+      relevant = given  `unionBind` \g ->
+                 wanted `unionBind` \w ->
                  singleton $ (g, w, Set.delete w wanted)
                  
       attempt (g, w, wanted') = (`fmap` simplifies g w) $ \r -> 
@@ -459,14 +471,41 @@ ruleSimplification (tch, subst, given, wanted) = pickFirst . map attempt . toLis
            return (tch, subst, given,  wanted' `union` w)   
     
                       
-topreact :: Toplevel -> Role -> Constraint -> Solver (Maybe (Touchables, Set Constraint))
-topreact = undefined
-                          
+sequenceSet :: (Ord a, Ord (m a)) => (Functor m, Monad m) => Set (m a) -> m (Set a)
+sequenceSet = fmap Set.fromList . sequence . Set.toList
+
+(>>-) :: Functor f => f a -> (a -> b) -> f b
+(>>-) = flip fmap
+
+topreact :: Set Toplevel -> Role -> Constraint -> Solver (Maybe (Touchables, Set Constraint))
+topreact tl role (Equality (TyFam nm ts :~ ty)) = 
+  let tryReaction (TopTyFam nm0 [(ts0, ty0)]) | nm == nm0 = 
+        do  let a = fuv ts0
+                
+                b = fuv ty0
+                c = Set.toList $ a `difference` b
+            
+                substB = Set.toList b >>- \b -> (b, undefined)
+            substC <-    sequence $ c >>- \c -> do gamma <- fresh
+                                                   return (c, gamma)
+            
+            let tch = case role of
+                            Wanted -> Set.fromList $ substC >>- \(_, gamma) -> gamma 
+                            Given  -> Set.empty
+                substB' = Subst $ Map.fromList substB
+                substC' = Subst $ Map.fromList . map (\(c, gamma) -> (c, TyVar . UnificationVariable $ gamma)) $ substC
+                
+                destructed = Set.singleton . Equality $ applySubst (substB' <> substC') ty0 :~ ty
+                            
+            return $ Just (tch, destructed)
+      tryReaction _ | otherwise = return $ Nothing
+  in fmap msum . sequence . map tryReaction . toList $ tl
+  
 -- Try to canonicalize one atomic constraint. The atomic constraints from the given/wanted 
 -- list are tried one at a time. The rule either succeeds directly after the first success
 -- or returns Nothing if all constraints are already canonic.
                           
-ruleTop :: Toplevel -> Role -> Quadruple -> Solver (Maybe Quadruple)
+ruleTop :: Set Toplevel -> Role -> Quadruple -> Solver (Maybe Quadruple)
 ruleTop tl role (tch, subst, given, wanted) = pickFirst . map attempt $ choices where
       pivot = case role of 
                 Given  -> given
@@ -495,7 +534,7 @@ ruleTop tl role (tch, subst, given, wanted) = pickFirst . map attempt $ choices 
                       
 -- Rewrite the quadruple until no more rewrite steps are possible. Returns Nothing
 -- if no rewrite was applicable.
-rewriter :: Toplevel -> Quadruple -> Solver (Maybe Quadruple)
+rewriter :: Set Toplevel -> Quadruple -> Solver (Maybe Quadruple)
 rewriter tl quad =
   let  rules = [ ruleCanon Given
                , ruleCanon Wanted
@@ -533,7 +572,7 @@ restrictSubstitution :: Touchables -> Subst -> Subst
 restrictSubstitution = undefined
 
 
-simplifier :: Toplevel                         -- Top-level constraints
+simplifier :: Set Toplevel                         -- Top-level constraints
            -> Set Constraint                   -- Q_Given
            -> Touchables                       -- Touchables
            -> Set Constraint                   -- Q_Wanted
