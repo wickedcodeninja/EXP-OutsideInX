@@ -72,7 +72,11 @@ implicationPart m = unionMap m $ \case BaseConstraint _        -> Set.empty
                                        ImplicationConstraint i -> singleton i
                                     
 
-type Toplevel = ()
+data Toplevel 
+  = TopBasic Constraint
+  | TopTyFam            (String, [Monotype]) Monotype -- F V ~ v
+  | TopClass Constraint (String, [Monotype])          -- Q => D V
+
 type Touchables = Set FUV
 
 
