@@ -2,7 +2,7 @@
 
 {-# LANGUAGE TypeSynonymInstances, FlexibleInstances, LambdaCase #-}
 
-import Prelude hiding ( null, interact )
+import Prelude hiding ( null, interact, concatMap )
 
 import Data.Monoid
 import Data.Foldable hiding ( msum, and, or )
@@ -32,7 +32,6 @@ data Monotype
   | TyCon String [Monotype]
   | TyFam String [Monotype]
   | ConcreteType String 
-
   deriving (Eq)
 
 -- fig 20 page 58
@@ -59,13 +58,15 @@ data ExtendedConstraint
   
 data Toplevel 
   = TopBasic Constraint
-  | TopTyFam String [([Monotype], Monotype)] -- F V ~ v. List of ordered equations for closed type families.
-                                      
+  | TopTyFam String [([Monotype], Monotype)] -- F V ~ v. List of ordered equations for closed type families.                                      
   | TopClass String Constraint [Monotype]    -- Q => D V
 
-  
+
 unionBind :: (Ord a, Ord b) => Set a -> (a -> Set b) -> Set b
-unionBind m f = flatten (Set.map f m)
+unionBind = flip unionMap
+
+unionMap :: (Ord a, Ord b) => (a -> Set b) -> Set a -> Set b
+unionMap f = flatten . Set.map f
 
 flatten :: Ord a => Set (Set a) -> Set a
 flatten = Set.unions . toList
@@ -82,27 +83,33 @@ implicationPart m = m `unionBind` \case BaseConstraint _        -> Set.empty
 
 type Touchables = Set FUV
 
-
-data Subst = Subst (Map.Map FUV Monotype)
+data Subst = Subst { runSubst :: Map.Map FUV Monotype }
 
 instance Monoid Subst where
-  mempty = Subst Map.empty
-  x@(Subst a) `mappend` y@(Subst b) = Subst $ Map.unionWith (flip const) a (Map.map (applySubst x) b)
+  mempty = Subst $ Map.empty
+  x@(Subst a) `mappend` y@(Subst b) = Subst $ Map.map (applySubst x) b `Map.union` a
 
 
 dom :: Subst -> Set FUV 
-dom (Subst s) = Set.fromList . Map.keys $ s 
+dom = Set.fromList . Map.keys . runSubst 
   
 class OverloadedFUV a where
   fuv :: a -> Set FUV
-  
- 
+
+instance OverloadedFUV Constraint where
+  fuv (Equality (a :~ b)) = fuv a `union` fuv b
+  fuv (TypeClass nm tys)  = unionMap fuv . Set.fromList $ tys
 instance OverloadedFUV (Set Constraint) where
-  fuv = undefined
+  fuv = unionMap fuv
 instance OverloadedFUV Monotype where
-  fuv = undefined 
+  fuv (TyVar (UnificationVariable a)) = singleton a
+  fuv (TyVar _)         = error "Do we like Skolem?"
+  fuv (TyCon nm tys)    = unionMap fuv . Set.fromList $ tys
+  fuv (TyFam nm tys)    = unionMap fuv . Set.fromList $ tys
+  fuv (ConcreteType nm) = Set.empty
+  
 instance OverloadedFUV [Monotype] where
-  fuv = undefined 
+  fuv tys = unionMap fuv . Set.fromList $ tys
   
   
 
@@ -291,7 +298,10 @@ canon role (Equality ec) = canonEquality ec where
                                Given  -> (singleton beta, mempty)
                                Wanted -> (Set.empty, substFromList [(beta, r)])                      
  
-       return $ Just (tch, subst, Set.fromList $ [Equality $ typ :~ reconstructRelevant (reconstructTypeFamily wrappedBeta), Equality (r :~ wrappedBeta)])
+       return $ Just ( tch
+                     , subst
+                     , Set.fromList $ [Equality $ typ :~ reconstructRelevant (reconstructTypeFamily wrappedBeta), Equality (r :~ wrappedBeta)]
+                     )
        
 canon role (TypeClass nm ts) | and (map isTypeFamilyFree ts)
                              , Just (reconstructTypeFamily, r) <- extractTypeFamily ts
@@ -304,7 +314,11 @@ canon role (TypeClass nm ts) | and (map isTypeFamilyFree ts)
                              Given  -> (singleton beta, mempty)
                              Wanted -> (Set.empty, substFromList [(beta, r)])
      
-     return $ Just (tch, subst, Set.fromList $ [TypeClass nm (reconstructTypeFamily wrappedBeta), Equality (r :~ wrappedBeta)])
+     return $ Just ( tch
+                   , subst
+                   , Set.fromList $ [TypeClass nm (reconstructTypeFamily wrappedBeta)
+                   , Equality (r :~ wrappedBeta)]
+                   ) 
 canon role _ = return Nothing       
   
  
@@ -323,7 +337,7 @@ ruleCanon role (tch, subst, given, wanted) = pickFirst . map attempt $ choices w
       choices = map (\[q1] -> (q1, Set.difference pivot . singleton $ q1) ) . pick 1 . Set.toList $ pivot
  
       attempt :: (Constraint, Set Constraint) -> Solver (Maybe Quadruple)
-      attempt (q1, rest) = (`fmap` canon role q1) $ \r ->
+      attempt (q1, rest) = canon role q1 >>- \r ->
         do (tch', subst', q2) <- r
            let replaced = Set.union q2 rest
 
@@ -405,7 +419,7 @@ ruleInteract role (tch, subst, given, wanted) = pickFirst . map attempt $ choice
       
       -- Let one pair interact
       attempt :: (Constraint, Constraint, Set Constraint) -> Solver (Maybe Quadruple)
-      attempt (q1, q2, rest) = (`fmap` interact q1 q2) $ \r -> 
+      attempt (q1, q2, rest) = interact q1 q2 >>- \r -> 
           do q3 <- r
              let replaced = Set.union q3 rest
 
@@ -447,8 +461,8 @@ simplifies (Equality a) (Equality b) = fmap (fmap (Set.map Equality)) (simplifie
                                                              , or (map (occurs va) ts)
                                                              , UnificationVariable uva <- va
                                                              = return . Just . Set.fromList $
-                                                               [ TyFam nm (map (applySubst $ substFromList [(uva, a)]) ts) :~ b
-                                                               ]
+                                                                 [ TyFam nm (map (applySubst $ substFromList [(uva, a)]) ts) :~ b
+                                                                 ]
   simplifiesEquality x@(TyFam nma tsa :~ a) y@(TyFam nmb tsb :~ b) | nma == nmb
                                                                    , tsa == tsb
                                                                    = return . Just . Set.fromList  $
@@ -466,14 +480,15 @@ ruleSimplification (tch, subst, given, wanted) = pickFirst . map attempt . toLis
                  wanted `unionBind` \w ->
                  singleton $ (g, w, Set.delete w wanted)
                  
-      attempt (g, w, wanted') = (`fmap` simplifies g w) $ \r -> 
+      attempt (g, w, wanted') = simplifies g w >>- \r -> 
         do w <- r
-           return (tch, subst, given,  wanted' `union` w)   
+           return ( tch
+                  , subst
+                  , given
+                  , wanted' `union` w
+                  )   
     
                       
-sequenceSet :: (Ord a, Ord (m a)) => (Functor m, Monad m) => Set (m a) -> m (Set a)
-sequenceSet = fmap Set.fromList . sequence . Set.toList
-
 (>>-) :: Functor f => f a -> (a -> b) -> f b
 (>>-) = flip fmap
 
@@ -486,8 +501,9 @@ topreact tl role (Equality (TyFam nm ts :~ ty)) =
                 c = Set.toList $ a `difference` b
             
                 substB = Set.toList b >>- \b -> (b, undefined)
-            substC <-    sequence $ c >>- \c -> do gamma <- fresh
-                                                   return (c, gamma)
+            substC <- forM c $ \c -> 
+                        do gamma <- fresh
+                           return (c, gamma)
             
             let tch = case role of
                             Wanted -> Set.fromList $ substC >>- \(_, gamma) -> gamma 
@@ -497,9 +513,11 @@ topreact tl role (Equality (TyFam nm ts :~ ty)) =
                 
                 destructed = Set.singleton . Equality $ applySubst (substB' <> substC') ty0 :~ ty
                             
-            return $ Just (tch, destructed)
+            return $ Just ( tch
+                          , destructed
+                          )
       tryReaction _ | otherwise = return $ Nothing
-  in fmap msum . sequence . map tryReaction . toList $ tl
+  in fmap msum . traverse tryReaction . toList $ tl
   
 -- Try to canonicalize one atomic constraint. The atomic constraints from the given/wanted 
 -- list are tried one at a time. The rule either succeeds directly after the first success
@@ -515,7 +533,7 @@ ruleTop tl role (tch, subst, given, wanted) = pickFirst . map attempt $ choices 
       choices = map (\[q1] -> (q1, Set.difference pivot . singleton $ q1) ) . pick 1 . toList $ pivot
  
       attempt :: (Constraint, Set Constraint) -> Solver (Maybe Quadruple)
-      attempt (q1, rest) = (`fmap` topreact tl role q1) $ \r ->
+      attempt (q1, rest) = topreact tl role q1 >>- \r ->
         do (tch', q2) <- r
            let replaced = union q2 rest
 
@@ -572,7 +590,7 @@ restrictSubstitution :: Touchables -> Subst -> Subst
 restrictSubstitution = undefined
 
 
-simplifier :: Set Toplevel                         -- Top-level constraints
+simplifier :: Set Toplevel                     -- Top-level constraints
            -> Set Constraint                   -- Q_Given
            -> Touchables                       -- Touchables
            -> Set Constraint                   -- Q_Wanted
