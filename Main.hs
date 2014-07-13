@@ -49,9 +49,9 @@ variableFromEnum s =
                             else Nothing
       parseChar _ = Nothing
   in case msum [ parseChar s :: Maybe Int
-                , fmap (\t -> t + lowercaseRange) . readMaybe $ s :: Maybe Int
-                ] of Just n -> n
-                     _      -> error "fromEnum: invalid UV" 
+               , fmap (\t -> t + lowercaseRange) . readMaybe $ s :: Maybe Int
+               ] of Just n -> n
+                    _      -> error "fromEnum: invalid parse" 
 
 instance Enum RV where
   toEnum = RV . variableToEnum
@@ -74,13 +74,27 @@ data Monotype
   = TyVar TypeVariable
   | TyCon String [Monotype]
   | TyFam String [Monotype]
-  | ConcreteType String 
   deriving (Eq)
 
 -- fig 20 page 58
 instance Ord Monotype where
-  compare = undefined
+  TyFam nm1 tys1                `compare` TyFam nm2 tys2                = (nm1, tys1) `compare` (nm2, tys2) -- Not specified in fig 20, but shouldn't harm to orient them anyway.
+  TyFam _   _                   `compare` _                             = LT
+  _                             `compare` TyFam _   _                   = GT
   
+  TyVar (UnificationVariable _) `compare` TyVar (RigidVariable _)       = LT
+  TyVar (RigidVariable _)       `compare` TyVar (UnificationVariable _) = GT
+  
+  TyVar (UnificationVariable a) `compare` TyVar (UnificationVariable b) = a `compare` b
+  TyVar (RigidVariable a)       `compare` TyVar (RigidVariable b)       = a `compare` b
+  
+  TyVar _                       `compare` t       | isTypeFamilyFree t  = LT
+  t                             `compare` TyVar _ | isTypeFamilyFree t  = GT
+  
+  
+  TyCon nm1 tys1                `compare` TyCon nm2 tys2                = (nm1, tys1) `compare` (nm2, tys2) -- Also not specified.
+  TyCon _   _                   `compare` t                             = GT
+  t                             `compare` TyCon _   _                   = LT
   
 data Equality = (:~) Monotype Monotype
   deriving (Eq, Ord)
@@ -95,7 +109,7 @@ data Implication
   deriving (Eq, Ord)
 
 data ExtendedConstraint 
-  = BaseConstraint Constraint 
+  = BaseConstraint        Constraint 
   | ImplicationConstraint Implication
   deriving (Eq, Ord)
   
@@ -149,7 +163,6 @@ instance OverloadedFUV Monotype where
   fuv (TyVar (RigidVariable _))       = Set.empty
   fuv (TyCon nm tys)    = unionMap fuv . Set.fromList $ tys
   fuv (TyFam nm tys)    = unionMap fuv . Set.fromList $ tys
-  fuv (ConcreteType nm) = Set.empty
   
 instance OverloadedFUV [Monotype] where
   fuv tys = unionMap fuv . Set.fromList $ tys
@@ -169,7 +182,6 @@ instance OverloadedFTV Monotype where
   ftv (TyVar (RigidVariable a))       = singleton a
   ftv (TyCon nm tys)    = unionMap ftv . Set.fromList $ tys
   ftv (TyFam nm tys)    = unionMap ftv . Set.fromList $ tys
-  ftv (ConcreteType nm) = Set.empty
   
 instance OverloadedFTV [Monotype] where
   ftv tys = unionMap ftv . Set.fromList $ tys
