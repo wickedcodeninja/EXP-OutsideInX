@@ -647,22 +647,18 @@ rewriter tl quad =
              Just q'  -> go q'
           
   
--- page 66: 7.5, (2)
-seperateEqualities :: Set Constraint -> ( Set Equality    -- Type Equalities
-                                        , Set Constraint  -- Residual
-                                        )
-seperateEqualities = undefined
+-- 
 
 
-
--- page 66: 7.5, (3)
-extractSubstitution :: Set Equality -> Subst
-extractSubstitution = undefined
-
--- page 66: 7.5, SIMPLES
-restrictSubstitution :: Touchables -> Subst -> Subst
-restrictSubstitution = undefined
-
+-- page 66: 7.5, (4)
+extractSubstitution :: Set (UV, Monotype) -> (Subst, Set Constraint)
+extractSubstitution assocList = 
+  let magicMap = Map.fromListWith (\(a, as) (b, bs) -> (a, as ++ b : bs) ) . map (\(uv, t) -> (uv, (t, []))) . Set.toList $ assocList
+      residual = join . map (\(t, xs) -> map (\x -> (t, x)) xs) . Map.toList $ Map.map snd magicMap
+      
+  in ( Subst $ Map.map fst magicMap
+     , Set.fromList $ residual >>- \(b, t) -> Equality $ TyVar (UnificationVariable b) :~ t
+     )  
 
 simplifier :: Set Toplevel                     -- Top-level constraints
            -> Set Constraint                   -- Q_Given
@@ -674,14 +670,33 @@ simplifier tl oldGiven oldTouch oldWanted =
     
      (newTouch, phi, newGiven, newWanted) <- rewriter' tl (oldTouch, mempty, oldGiven, oldWanted)
      
-     let (eqPart, residual) = seperateEqualities (phi `applySubst` newWanted)
-         theta = restrictSubstitution oldTouch . extractSubstitution $ eqPart
-         substitutedResidual = theta `applySubst` residual
+     let -- Page 66: 7.5, (3)
+         seperated = Set.toList (phi `applySubst` newWanted) >>- \case
+                                      r@(Equality (TyVar (UnificationVariable b) :~ t)) -> if (b `Set.member` newTouch) && not (b `Set.member` fuv t)
+                                                                                              then (Just (b, t), Nothing)
+                                                                                              else (Nothing    , Just r )
+                                      r@(Equality (t :~ TyVar (UnificationVariable b))) -> if (b `Set.member` newTouch) && not (b `Set.member` fuv t)
+                                                                                              then (Just (b, t), Nothing)
+                                                                                              else (Nothing    , Just r )
+                                      r                                                 ->         (Nothing    , Just r )   
          
-     assert (dom theta `isSubsetOf` oldTouch) $ "simplifier: substitution concerns non-touchable variables" 
-     assert (dom theta # fuv substitutedResidual) $ "simplifier: domain of final substitution should be disjoint from residual"
+         (eqPart, residualPart) = ( Set.fromList . catMaybes $ map fst seperated -- Substitutions b ~> t
+                                  , Set.fromList . catMaybes $ map snd seperated -- List of remaining equalities b ~> t' with t' /= t
+                                  )
+         
+         -- Page 66: 7.5, (4) 
+         (theta, remainingEqualities) = extractSubstitution $ eqPart
+         
+         -- Page 66: 7.5, below (4) 
+         restrictedTheta = Subst . Map.mapMaybeWithKey selector . runSubst $ theta where
+           selector k a | k `Set.member` oldTouch = Just a   -- Restrict the domain of the generated substitution 
+           selector k _ | otherwise               = Nothing  -- to the original touchables list
+         substitutedResidual = theta `applySubst` (residualPart `union` remainingEqualities)
+         
+     assert (dom restrictedTheta `isSubsetOf` oldTouch) $ "simplifier: substitution concerns non-touchable variables" 
+     assert (dom restrictedTheta # fuv substitutedResidual) $ "simplifier: domain of final substitution should be disjoint from residual"
      
-     return $ (substitutedResidual, theta)
+     return $ (substitutedResidual, restrictedTheta)
   
   
 
