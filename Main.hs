@@ -149,7 +149,39 @@ instance Monoid Subst where
 
 dom :: Subst -> Set UV 
 dom = Set.fromList . Map.keys . runSubst 
+
+class SubstApply a where
+  applySubst :: Subst -> a -> a
+
+instance SubstApply ExtendedConstraint where
+  applySubst m (BaseConstraint b) = BaseConstraint (applySubst m b)
+  applySubst m (ImplicationConstraint i) = ImplicationConstraint (applySubst m i)
   
+
+instance SubstApply Implication where
+  applySubst m (Implication c e tch) -- assert tch # fuv(m) ?
+    = Implication (applySubst m c) (applySubst m e) tch
+    
+instance SubstApply Monotype where
+  applySubst m ty@(TyVar (UnificationVariable uv)) = 
+    case Map.lookup uv (runSubst m) of
+      Just t  -> t
+      Nothing -> ty
+  applySubst m ty@(TyVar (RigidVariable        _)) = ty 
+  applySubst m (TyCon nm tys) = TyCon nm $ map (applySubst m) tys
+  applySubst m (TyFam nm tys) = TyFam nm $ map (applySubst m) tys
+
+instance SubstApply Equality where
+  applySubst m (a :~ b) = applySubst m a :~ applySubst m b
+  
+instance SubstApply Constraint where
+  applySubst m (Equality r) = Equality $ applySubst m r 
+  
+instance (Ord a, SubstApply a) => SubstApply (Set a) where
+  applySubst m r = Set.map (applySubst m) r
+    
+
+
 class OverloadedFUV a where
   fuv :: a -> Set UV
 
@@ -203,28 +235,6 @@ instance Monad Error where
 type Solver a = StateT UV Error a
 
                                       
-class SubstApply a where
-  applySubst :: Subst -> a -> a
-
-instance SubstApply ExtendedConstraint where
-  applySubst subst (BaseConstraint b) = BaseConstraint (applySubst subst b)
-  applySubst subst (ImplicationConstraint i) = ImplicationConstraint (applySubst subst i)
-  
-
-instance SubstApply Implication where
-  applySubst subst (Implication c e tch) -- assert tch # fuv(subst) ?
-    = Implication (applySubst subst c) (applySubst subst e) tch
-
-instance SubstApply Monotype where
-  applySubst subst _ = undefined
-    
-instance SubstApply Constraint where
-  applySubst subst _ 
-    = error "Substitutions on Constraints not implemented yet"
-
-instance SubstApply a => SubstApply (Set a) where
-  applySubst = undefined
-    
 release_mode :: Bool
 release_mode = False
  
@@ -287,11 +297,22 @@ pickFirst (x:xs) = do r <- x
                         a@(Just _)  -> return a
 
 isTypeFamilyFree :: Monotype -> Bool
-isTypeFamilyFree = undefined
+isTypeFamilyFree (TyVar _) = True
+isTypeFamilyFree (TyCon nm tys) = and $ map isTypeFamilyFree tys
+isTypeFamilyFree (TyFam _  _  ) = False
 
 occurs :: TypeVariable -> Monotype -> Bool
-occurs = undefined
-      
+occurs (UnificationVariable uv) = check where
+  check (TyVar (UnificationVariable uv')) = uv == uv'
+  check (TyVar (RigidVariable _))         = False
+  check (TyCon _ tys) = or $ map check tys
+  check (TyFam _ tys) = or $ map check tys
+occurs (RigidVariable rv) = check where
+  check (TyVar (UnificationVariable _)) = False
+  check (TyVar (RigidVariable rv'))     = rv == rv'
+  check (TyCon _ tys) = or $ map check tys
+  check (TyFam _ tys) = or $ map check tys
+  
 substFromList :: [(UV, Monotype)] -> Subst
 substFromList = Subst . Map.fromList
 
