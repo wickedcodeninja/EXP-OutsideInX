@@ -22,9 +22,52 @@ import qualified Data.Set as Set
 import qualified Data.Map as Map
 
 data TypeVariable 
-  = UnificationVariable FUV
-  | SkolemVariable -- where do we need this?
+  = UnificationVariable UV
+  | RigidVariable RV
   deriving (Eq, Ord)
+
+newtype RV = RV { runRV :: String } 
+  deriving (Show, Eq)
+  
+newtype UV = UV { runUV :: String }
+  deriving (Show, Eq)
+  
+  
+variableToEnum :: Int -> String  
+variableToEnum n = 
+  if n >= 0 && n < 0 + lowercaseRange
+     then [chr (ord 'a' + n)]
+     else show (n - lowercaseRange) 
+  where
+    lowercaseRange = ord 'z' - ord 'a' + 1 
+  
+variableFromEnum :: String -> Int
+variableFromEnum s = 
+  let lowercaseRange = ord 'z' - ord 'a' + 1
+      parseChar (x:[]) = if ord x >= ord 'a' && ord x <= ord 'z'
+                            then Just $ ord x - ord 'a'
+                            else Nothing
+      parseChar _ = Nothing
+  in case msum [ parseChar s :: Maybe Int
+                , fmap (\t -> t + lowercaseRange) . readMaybe $ s :: Maybe Int
+                ] of Just n -> n
+                     _      -> error "fromEnum: invalid UV" 
+
+instance Enum RV where
+  toEnum = RV . variableToEnum
+  fromEnum = variableFromEnum . runRV
+              
+instance Enum UV where
+  toEnum = UV . variableToEnum
+  fromEnum = variableFromEnum . runUV
+
+instance Ord RV where
+  compare a b = compare (fromEnum a) (fromEnum b)
+  
+instance Ord UV where
+  compare a b = compare (fromEnum a) (fromEnum b)
+
+
   
 
 data Monotype 
@@ -81,20 +124,20 @@ implicationPart m = m `unionBind` \case BaseConstraint _        -> Set.empty
                                     
 
 
-type Touchables = Set FUV
+type Touchables = Set UV
 
-data Subst = Subst { runSubst :: Map.Map FUV Monotype }
+data Subst = Subst { runSubst :: Map.Map UV Monotype }
 
 instance Monoid Subst where
   mempty = Subst $ Map.empty
   x@(Subst a) `mappend` y@(Subst b) = Subst $ Map.map (applySubst x) b `Map.union` a
 
 
-dom :: Subst -> Set FUV 
+dom :: Subst -> Set UV 
 dom = Set.fromList . Map.keys . runSubst 
   
 class OverloadedFUV a where
-  fuv :: a -> Set FUV
+  fuv :: a -> Set UV
 
 instance OverloadedFUV Constraint where
   fuv (Equality (a :~ b)) = fuv a `union` fuv b
@@ -103,7 +146,7 @@ instance OverloadedFUV (Set Constraint) where
   fuv = unionMap fuv
 instance OverloadedFUV Monotype where
   fuv (TyVar (UnificationVariable a)) = singleton a
-  fuv (TyVar _)         = error "Do we like Skolem?"
+  fuv (TyVar (RigidVariable _))       = Set.empty
   fuv (TyCon nm tys)    = unionMap fuv . Set.fromList $ tys
   fuv (TyFam nm tys)    = unionMap fuv . Set.fromList $ tys
   fuv (ConcreteType nm) = Set.empty
@@ -112,26 +155,24 @@ instance OverloadedFUV [Monotype] where
   fuv tys = unionMap fuv . Set.fromList $ tys
   
   
+-- TODO: Free Rigid Variables?? 
+class OverloadedFTV a where
+  ftv :: a -> Set RV
 
-data FUV = FUV String
-  deriving (Show, Eq)
-instance Enum FUV where
-  toEnum n = if n >= 0 && n < 0 + lowercaseRange
-                then FUV $ [chr (ord 'a' + n)]
-                else FUV $ show (n - lowercaseRange) where
-    lowercaseRange = ord 'z' - ord 'a' + 1 
-  fromEnum (FUV s) = 
-    let lowercaseRange = ord 'z' - ord 'a' + 1
-        parseChar (x:[]) = if ord x >= ord 'a' && ord x <= ord 'z'
-                              then Just $ ord x - ord 'a'
-                              else Nothing
-        parseChar _ = Nothing
-    in case msum [ parseChar s :: Maybe Int
-                 , fmap (\t -> t + lowercaseRange) . readMaybe $ s :: Maybe Int
-                 ] of Just n -> n
-                      _      -> error "fromEnum: invalid FUV" 
-instance Ord FUV where
-  compare a b = compare (fromEnum a) (fromEnum b)
+instance OverloadedFTV Constraint where
+  ftv (Equality (a :~ b)) = ftv a `union` ftv b
+  ftv (TypeClass nm tys)  = unionMap ftv . Set.fromList $ tys
+instance OverloadedFTV (Set Constraint) where
+  ftv = unionMap ftv
+instance OverloadedFTV Monotype where
+  ftv (TyVar (UnificationVariable _)) = Set.empty
+  ftv (TyVar (RigidVariable a))       = singleton a
+  ftv (TyCon nm tys)    = unionMap ftv . Set.fromList $ tys
+  ftv (TyFam nm tys)    = unionMap ftv . Set.fromList $ tys
+  ftv (ConcreteType nm) = Set.empty
+  
+instance OverloadedFTV [Monotype] where
+  ftv tys = unionMap ftv . Set.fromList $ tys
        
   
   
@@ -147,7 +188,7 @@ instance Monad Error where
   return = Value
   fail = Error
   
-type Solver a = StateT FUV Error a
+type Solver a = StateT UV Error a
 
                                       
 class SubstApply a where
@@ -178,11 +219,11 @@ release_mode = False
 assert :: Bool -> String -> Solver ()
 assert b s = if (release_mode || b) then return () else error s
  
-(#) :: Set FUV -> Set FUV -> Bool
+(#) :: Set UV -> Set UV -> Bool
 a # b = Set.null (a `intersection` b) 
  
 
-fresh :: Solver FUV
+fresh :: Solver UV
 fresh = StateT $ \fuv -> Value (fuv, succ fuv)
  
 solver :: Set Toplevel                --Top-level constraints
@@ -239,16 +280,16 @@ isTypeFamilyFree = undefined
 occurs :: TypeVariable -> Monotype -> Bool
 occurs = undefined
       
-substFromList :: [(FUV, Monotype)] -> Subst
+substFromList :: [(UV, Monotype)] -> Subst
 substFromList = Subst . Map.fromList
 
 isTypeFamily :: Monotype -> Bool
 isTypeFamily (TyFam _ _) = True
 isTypeFamily _           = False
 
-isTypeVariable :: Monotype -> Bool
-isTypeVariable (TyVar _) = True
-isTypeVariable _         = False
+isVariable :: Monotype -> Bool
+isVariable (TyVar _) = True
+isVariable _         = False
 
 extractTypeFamily :: [Monotype] -> Maybe (Monotype -> [Monotype], Monotype)
 extractTypeFamily []     = Nothing 
@@ -286,7 +327,7 @@ canon role (Equality ec) = canonEquality ec where
      
        return $ Just (tch, subst, Set.fromList $ [Equality $ TyFam nm (reconstructTypeFamily wrappedBeta) :~ typ, Equality (r :~ wrappedBeta)]) 
   canonEquality ( typ :~ rhs ) | Just (reconstructRelevant, ts) <- extractRelevant rhs
-                               , isTypeFamily typ || isTypeVariable typ
+                               , isTypeFamily typ || isVariable typ
                                , and (map isTypeFamilyFree ts)
                                , Just (reconstructTypeFamily, r) <- extractTypeFamily ts 
                                = 
