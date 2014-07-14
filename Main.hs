@@ -116,7 +116,7 @@ data ExtendedConstraint
 data Toplevel 
   -- = TopBasic Constraint
   = TopTyFam String [([Monotype], Monotype)] -- F V ~ v. List of ordered equations for closed type families.                                      
-  | TopClass String Constraint [Monotype]    -- Q => D V
+  | TopClass String (Set Constraint) [Monotype]    -- Q => D V
 
 
 unionBind :: (Ord a, Ord b) => Set a -> (a -> Set b) -> Set b
@@ -573,42 +573,56 @@ instance Monoid RigidSubst where
   x@(RigidSubst a) `mappend` y@(RigidSubst b) = RigidSubst $ Map.map (instantiate x) b `Map.union` a
 
   
-instantiate :: RigidSubst -> Monotype -> Monotype
-instantiate m ty@(TyVar (RigidVariable rv)) = 
-  case Map.lookup rv (runRigidSubst m) of
-    Just t  -> t
-    Nothing -> ty
-instantiate m ty@(TyVar (UnificationVariable _)) = ty 
-instantiate m (TyCon nm tys) = TyCon nm $ map (instantiate m) tys
-instantiate m (TyFam nm tys) = TyFam nm $ map (instantiate m) tys
+class Instantiate r where
+  instantiate :: RigidSubst -> r -> r
+  
+instance Instantiate Monotype where
+  instantiate m ty@(TyVar (RigidVariable rv)) = 
+    case Map.lookup rv (runRigidSubst m) of
+      Just t  -> t
+      Nothing -> ty
+  instantiate m ty@(TyVar (UnificationVariable _)) = ty 
+  instantiate m (TyCon nm tys) = TyCon nm $ map (instantiate m) tys
+  instantiate m (TyFam nm tys) = TyFam nm $ map (instantiate m) tys
 
-findInstantiationChained :: [Monotype] -> [Monotype] -> RigidSubst -> Maybe RigidSubst
-findInstantiationChained []     []     s0 = Just s0
-findInstantiationChained (x:xs) (y:ys) s0 = 
-  do s1 <- findInstantiation (instantiate s0 x) (instantiate s0 y)
-     findInstantiationChained xs ys (s1 <> s0) 
-findInstantiationChained _ _ _            = Nothing
+instance Instantiate Constraint where
+  instantiate m (Equality (a :~ b)) = Equality (instantiate m a :~ instantiate m b)
+  instantiate m (TypeClass nm tys) = TypeClass nm (map (instantiate m) tys)
 
-findInstantiation :: Monotype -> Monotype -> Maybe RigidSubst
-findInstantiation (TyVar (UnificationVariable a)) _                         = Nothing -- LHS shouldn't contain unification variables
-findInstantiation _                               (TyVar (RigidVariable b)) = Nothing -- RHS should already be instantiated
-findInstantiation (TyVar (RigidVariable a))       r                         = Just $ RigidSubst . Map.fromList $ [(a, r)]
+instance Instantiate (Set Constraint) where
+  instantiate m = Set.map (instantiate m)
 
-findInstantiation (TyCon nm1 tys1) (TyCon nm2 tys2) = if nm1 == nm2
-                                                         then findInstantiationChained tys1 tys2 mempty
-                                                         else Nothing
-findInstantiation (TyFam nm1 tys1) (TyFam nm2 tys2) = if nm1 == nm2
-                                                         then findInstantiationChained tys1 tys2 mempty
-                                                         else Nothing
-findInstantiation _ _                               = Nothing
+findInstantiationChained :: FamilyFree -> [Monotype] -> [Monotype] -> RigidSubst -> Maybe RigidSubst
+findInstantiationChained ff []     []     s0 = Just s0
+findInstantiationChained ff (x:xs) (y:ys) s0 = 
+  do s1 <- findInstantiation ff (instantiate s0 x) (instantiate s0 y)
+     findInstantiationChained ff xs ys (s1 <> s0) 
+findInstantiationChained ff _ _ _            = Nothing
+
+data FamilyFree = FamilyFree | WithSpouses
+
+findInstantiation :: FamilyFree -> Monotype -> Monotype -> Maybe RigidSubst
+findInstantiation ff (TyVar (UnificationVariable a)) _                         = Nothing -- LHS shouldn't contain unification variables
+findInstantiation ff _                               (TyVar (RigidVariable b)) = Nothing -- RHS should already be instantiated
+findInstantiation FamilyFree  (TyVar (RigidVariable a)) r | isTypeFamilyFree r = Just $ RigidSubst . Map.fromList $ [(a, r)]
+findInstantiation WithSpouses (TyVar (RigidVariable a)) r                      = Just $ RigidSubst . Map.fromList $ [(a, r)]
+
+
+findInstantiation ff (TyCon nm1 tys1) (TyCon nm2 tys2) = if nm1 == nm2
+                                                           then findInstantiationChained ff tys1 tys2 mempty
+                                                           else Nothing
+findInstantiation ff (TyFam nm1 tys1) (TyFam nm2 tys2) = if nm1 == nm2
+                                                           then findInstantiationChained ff tys1 tys2 mempty
+                                                           else Nothing
+findInstantiation ff _ _                               = Nothing
                                              
 topreact :: Set Toplevel -> Role -> Constraint -> Solver (Maybe (Touchables, Set Constraint))
-topreact tl role (Equality (t@(TyFam nm tys) :~ ty)) | isTypeFamilyFree ty
-                                                 , and $ map isTypeFamilyFree tys 
-                                                 = fmap msum . traverse tryReaction . toList $ tl where
+topreact tl role (Equality ((TyFam nm tys) :~ ty)) | isTypeFamilyFree ty
+                                                   , and $ map isTypeFamilyFree tys 
+                                                   = fmap msum . traverse tryReaction . toList $ tl where
   tryReaction (TopTyFam nm0 [(tys0, ty0)]) | nm == nm0 
-                                           , Just s0 <- findInstantiationChained tys0 tys mempty -- The top-level axiom scheme can be instantiated to
-                                           = do let a = ftv tys0                                 -- solve the equation
+                                           , Just s0 <- findInstantiationChained WithSpouses tys0 tys mempty -- The top-level axiom scheme can be instantiated to
+                                           = do let a = ftv (ty0 : tys0)                                     -- solve the equation
                                   
                                                     b = ftv ty0
                                                     c = Set.toList $ a `difference` b
@@ -621,15 +635,39 @@ topreact tl role (Equality (t@(TyFam nm tys) :~ ty)) | isTypeFamilyFree ty
                                                                                Wanted -> Set.fromList $ tch
                                                                                Given  -> Set.empty
                                                                            )
-                                  
-                                                let destructed = Set.singleton . Equality $ instantiate (s1 <> s0) ty0 :~ ty
                                               
                                                 return $ Just ( delta
-                                                              , destructed
+                                                              , Set.singleton . Equality $ instantiate (s1 <> s0) ty0 :~ ty
                                                               )
   tryReaction _ | otherwise = return $ Nothing
-
   
+topreact tl Wanted (TypeClass nm tys) | and $ map isTypeFamilyFree tys 
+                                      = fmap msum . traverse tryReaction . toList $ tl where
+  tryReaction (TopClass nm0 q0 tys0) | nm == nm0 
+                                     , Just s0 <- findInstantiationChained FamilyFree tys0 tys mempty -- The top-level axiom scheme can be instantiated to
+                                     = do let a = ftv tys0 `union` ftv q0                             -- solve the equation
+                                 
+                                              b = ftv tys0
+                                              c = Set.toList $ a `difference` b
+                                
+                                          (s1, delta) <- do (subst, tch) <- fmap unzip . forM c $ \c -> 
+                                                                                           do gamma <- fresh
+                                                                                              return ( (c, TyVar . UnificationVariable $ gamma), gamma)
+                                                            return $ ( RigidSubst . Map.fromList $ subst
+                                                                     , Set.fromList $ tch
+                                                                     )
+                                  
+
+                                          return $ Just ( delta
+                                                        , instantiate (s1 <> s0) q0
+                                                        )
+  tryReaction _ | otherwise = return $ Nothing
+topreact tl Given (TypeClass nm tys) | and $ map isTypeFamilyFree tys 
+                                     = fmap msum . traverse tryReaction . toList $ tl where
+  tryReaction (TopClass nm0 q0 tys0) | nm == nm0 
+                                     , Just s0 <- findInstantiationChained FamilyFree tys0 tys mempty -- The top-level axiom scheme can be instantiated to
+                                     = fail $ "DINSTG: top level axiom overlaps with given constraint."
+                                     
 -- Try to canonicalize one atomic constraint. The atomic constraints from the given/wanted 
 -- list are tried one at a time. The rule either succeeds directly after the first success
 -- or returns Nothing if all constraints are already canonic.
