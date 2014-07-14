@@ -2,10 +2,10 @@
 
 {-# LANGUAGE TypeSynonymInstances, FlexibleInstances, LambdaCase #-}
 
-import Prelude hiding ( null, interact, concatMap )
+import Prelude hiding ( null, interact, concatMap, foldr )
 
 import Data.Monoid
-import Data.Foldable hiding ( msum, and, or )
+import Data.Foldable hiding ( msum, and, or, concat )
 import Data.Traversable ( traverse )
 
 import Control.Monad
@@ -114,8 +114,8 @@ data ExtendedConstraint
   deriving (Eq, Ord)
   
 data Toplevel 
-  = TopBasic Constraint
-  | TopTyFam String [([Monotype], Monotype)] -- F V ~ v. List of ordered equations for closed type families.                                      
+  -- = TopBasic Constraint
+  = TopTyFam String [([Monotype], Monotype)] -- F V ~ v. List of ordered equations for closed type families.                                      
   | TopClass String Constraint [Monotype]    -- Q => D V
 
 
@@ -566,32 +566,69 @@ ruleSimplification (tch, subst, given, wanted) = pickFirst . map attempt . toLis
 (>>-) :: Functor f => f a -> (a -> b) -> f b
 (>>-) = flip fmap
 
+newtype RigidSubst = RigidSubst { runRigidSubst :: Map.Map RV Monotype }
+
+instance Monoid RigidSubst where
+  mempty = RigidSubst $ Map.empty
+  x@(RigidSubst a) `mappend` y@(RigidSubst b) = RigidSubst $ Map.map (instantiate x) b `Map.union` a
+
+  
+instantiate :: RigidSubst -> Monotype -> Monotype
+instantiate m ty@(TyVar (RigidVariable rv)) = 
+  case Map.lookup rv (runRigidSubst m) of
+    Just t  -> t
+    Nothing -> ty
+instantiate m ty@(TyVar (UnificationVariable _)) = ty 
+instantiate m (TyCon nm tys) = TyCon nm $ map (instantiate m) tys
+instantiate m (TyFam nm tys) = TyFam nm $ map (instantiate m) tys
+
+findInstantiationChained :: [Monotype] -> [Monotype] -> RigidSubst -> Maybe RigidSubst
+findInstantiationChained []     []     s0 = Just s0
+findInstantiationChained (x:xs) (y:ys) s0 = 
+  do s1 <- findInstantiation (instantiate s0 x) (instantiate s0 y)
+     findInstantiationChained xs ys (s1 <> s0) 
+findInstantiationChained _ _ _            = Nothing
+
+findInstantiation :: Monotype -> Monotype -> Maybe RigidSubst
+findInstantiation (TyVar (UnificationVariable a)) _                         = Nothing -- LHS shouldn't contain unification variables
+findInstantiation _                               (TyVar (RigidVariable b)) = Nothing -- RHS should already be instantiated
+findInstantiation (TyVar (RigidVariable a))       r                         = Just $ RigidSubst . Map.fromList $ [(a, r)]
+
+findInstantiation (TyCon nm1 tys1) (TyCon nm2 tys2) = if nm1 == nm2
+                                                         then findInstantiationChained tys1 tys2 mempty
+                                                         else Nothing
+findInstantiation (TyFam nm1 tys1) (TyFam nm2 tys2) = if nm1 == nm2
+                                                         then findInstantiationChained tys1 tys2 mempty
+                                                         else Nothing
+findInstantiation _ _                               = Nothing
+                                             
 topreact :: Set Toplevel -> Role -> Constraint -> Solver (Maybe (Touchables, Set Constraint))
-topreact tl role (Equality (TyFam nm ts :~ ty)) = 
-  let tryReaction (TopTyFam nm0 [(ts0, ty0)]) | nm == nm0 = 
-        do  let a = fuv ts0
-                
-                b = fuv ty0
-                c = Set.toList $ a `difference` b
-            
-                substB = Set.toList b >>- \b -> (b, undefined)
-            substC <- forM c $ \c -> 
-                        do gamma <- fresh
-                           return (c, gamma)
-            
-            let tch = case role of
-                            Wanted -> Set.fromList $ substC >>- \(_, gamma) -> gamma 
-                            Given  -> Set.empty
-                substB' = Subst $ Map.fromList substB
-                substC' = Subst $ Map.fromList . map (\(c, gamma) -> (c, TyVar . UnificationVariable $ gamma)) $ substC
-                
-                destructed = Set.singleton . Equality $ applySubst (substB' <> substC') ty0 :~ ty
-                            
-            return $ Just ( tch
-                          , destructed
-                          )
-      tryReaction _ | otherwise = return $ Nothing
-  in fmap msum . traverse tryReaction . toList $ tl
+topreact tl role (Equality (t@(TyFam nm tys) :~ ty)) | isTypeFamilyFree ty
+                                                 , and $ map isTypeFamilyFree tys 
+                                                 = fmap msum . traverse tryReaction . toList $ tl where
+  tryReaction (TopTyFam nm0 [(tys0, ty0)]) | nm == nm0 
+                                           , Just s0 <- findInstantiationChained tys0 tys mempty -- The top-level axiom scheme can be instantiated to
+                                           = do let a = ftv tys0                                 -- solve the equation
+                                  
+                                                    b = ftv ty0
+                                                    c = Set.toList $ a `difference` b
+                                
+                                                (s1, delta) <- do (subst, tch) <- fmap unzip . forM c $ \c -> 
+                                                                                                 do gamma <- fresh
+                                                                                                    return ( (c, TyVar . UnificationVariable $ gamma), gamma)
+                                                                  return $ ( RigidSubst . Map.fromList $ subst
+                                                                           , case role of
+                                                                               Wanted -> Set.fromList $ tch
+                                                                               Given  -> Set.empty
+                                                                           )
+                                  
+                                                let destructed = Set.singleton . Equality $ instantiate (s1 <> s0) ty0 :~ ty
+                                              
+                                                return $ Just ( delta
+                                                              , destructed
+                                                              )
+  tryReaction _ | otherwise = return $ Nothing
+
   
 -- Try to canonicalize one atomic constraint. The atomic constraints from the given/wanted 
 -- list are tried one at a time. The rule either succeeds directly after the first success
