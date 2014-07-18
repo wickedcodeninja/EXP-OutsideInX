@@ -288,6 +288,7 @@ data Role
   deriving (Eq, Show) 
 type Quadruple = (Touchables, Subst, Set Constraint, Set Constraint)
 
+-- Run all calculations in the given Monad until the first one succeeds with a Just
 
 pickFirst :: Monad m => [m (Maybe a)] -> m (Maybe a) 
 pickFirst []     = return Nothing
@@ -562,7 +563,8 @@ ruleSimplification (tch, subst, given, wanted) = pickFirst . map attempt . toLis
                   , wanted' `union` w
                   )   
     
-                      
+
+    
 (>>-) :: Functor f => f a -> (a -> b) -> f b
 (>>-) = flip fmap
 
@@ -572,7 +574,8 @@ instance Monoid RigidSubst where
   mempty = RigidSubst $ Map.empty
   x@(RigidSubst a) `mappend` y@(RigidSubst b) = RigidSubst $ Map.map (instantiate x) b `Map.union` a
 
-  
+-- Apply an `instantiation` substitution on a type scheme, instantiating the universally quantified variables to
+-- unification variables.
 class Instantiate r where
   instantiate :: RigidSubst -> r -> r
   
@@ -592,15 +595,13 @@ instance Instantiate Constraint where
 instance Instantiate (Set Constraint) where
   instantiate m = Set.map (instantiate m)
 
-findInstantiationChained :: TypeFamilyFree -> [Monotype] -> [Monotype] -> RigidSubst -> Maybe RigidSubst
-findInstantiationChained ff []     []     s0 = Just s0
-findInstantiationChained ff (x:xs) (y:ys) s0 = 
-  do s1 <- findInstantiation ff (instantiate s0 x) (instantiate s0 y)
-     findInstantiationChained ff xs ys (s1 <> s0) 
-findInstantiationChained ff _ _ _            = Nothing
 
 data TypeFamilyFree = TypeFamilyFree | TypeFamiliesAllowed
 
+
+-- Try to find a 'Rigid` substitution which instantiated the left Monotype to the right Monotype.
+-- When such an substitution is found, the axiom scheme for the left Monotype can be used to simplify
+-- the right (wanted/given) Monotype.
 findInstantiation :: TypeFamilyFree -> Monotype -> Monotype -> Maybe RigidSubst
 findInstantiation ff (TyVar (UnificationVariable a)) _                         = Nothing -- LHS shouldn't contain unification variables
 findInstantiation ff _                               (TyVar (RigidVariable b)) = Nothing -- RHS should already be instantiated
@@ -615,8 +616,22 @@ findInstantiation ff (TyFam nm1 tys1) (TyFam nm2 tys2) = if nm1 == nm2
                                                            then findInstantiationChained ff tys1 tys2 mempty
                                                            else Nothing
 findInstantiation ff _ _                               = Nothing
+ 
+-- Same as above, but with lists of Monotypes handled in bulk. 
+ 
+findInstantiationChained :: TypeFamilyFree -> [Monotype] -> [Monotype] -> RigidSubst -> Maybe RigidSubst
+findInstantiationChained ff []     []     s0 = Just s0
+findInstantiationChained ff (x:xs) (y:ys) s0 = 
+  do s1 <- findInstantiation ff (instantiate s0 x) (instantiate s0 y)
+     findInstantiationChained ff xs ys (s1 <> s0) 
+findInstantiationChained ff _ _ _            = Nothing
+
   
 type Equation = ([Monotype], Monotype)
+ 
+-- Type variables come in two flavours: rigid and unification. Rigid variables are
+-- part of a type scheme and need to be instantiated into unification variables before
+-- solving.
  
 unifyRigid :: [Monotype] -> [Monotype] -> Maybe RigidSubst
 unifyRigid xs ys = unifyRigid xs ys mempty where
@@ -632,12 +647,17 @@ unifyRigid xs ys = unifyRigid xs ys mempty where
   unify (TyFam nm1 tys1) (TyFam nm2 tys2) = unifyRigid tys1 tys2 mempty
   unify _                _                = Nothing
   
+-- Equations p, q are compatible if S lhs_p == S lhs_q ==> S rhs_p == S rhs_q
+-- for a unifying substitution S
 compat :: Equation -> Equation -> Bool
 compat (tys1, ty1) (tys2, ty2) = 
   case unifyRigid tys1 tys2 of
        Just s0 -> instantiate s0 ty1 == instantiate s0 ty2
        Nothing -> True
 
+
+-- Check if two equations are apart by flattening one of the equations and making 
+-- sure the the flattened equation doesn't unify with the other equation.
 apart :: Equation -> Equation -> Bool
 apart (tys1, _) (tys2, _) =
   case unifyRigid tys1 (flatten tys2) of
@@ -664,6 +684,9 @@ apart (tys1, _) (tys2, _) =
       in (TyCon nm newTys : ts', fresh'', prevs'')
       
 -- Choose the correct equation from a closed type family. Not optimized! See paper.
+-- The equations are tried one-by-one until the first one succeeds. Every equation
+-- is checked with all previous equations to check if it's either apart from or compatible 
+-- with the previous equation.
 chooseInstantiatedEquation :: [Equation] -- List of equations still to check
                            -> [Equation] -- Previous tried and failed equations
                            -> [Monotype] -> RigidSubst -> Maybe (RigidSubst, Equation)
@@ -703,13 +726,13 @@ topreact tl Wanted (TypeClass nm tys) | and $ map isTypeTypeFamilyFree tys
                                       = fmap msum . traverse tryReaction . toList $ tl where
   tryReaction (TopClass nm0 q0 tys0) | nm == nm0 
                                      , Just s0 <- findInstantiationChained TypeFamilyFree tys0 tys mempty -- The top-level axiom scheme can be instantiated to
-                                     = do let a = ftv tys0 `union` ftv q0                             -- solve the equation
+                                     = do let a = ftv tys0 `union` ftv q0                                 -- solve the equation
                                  
                                               b = ftv tys0
                                               c = Set.toList $ a `difference` b
                                 
-                                          (s1, delta) <- do (subst, tch) <- fmap unzip . forM c $ \c -> 
-                                                                                           do gamma <- fresh
+                                          (s1, delta) <- do (subst, tch) <- fmap unzip . forM c $ \c ->      -- Create fresh unification variables for rigid variables 
+                                                                                           do gamma <- fresh -- in ty0 but not in tys0
                                                                                               return ( (c, TyVar . UnificationVariable $ gamma), gamma)
                                                             return $ ( RigidSubst . Map.fromList $ subst
                                                                      , Set.fromList $ tch
@@ -723,7 +746,7 @@ topreact tl Wanted (TypeClass nm tys) | and $ map isTypeTypeFamilyFree tys
 topreact tl Given (TypeClass nm tys) | and $ map isTypeTypeFamilyFree tys 
                                      = fmap msum . traverse tryReaction . toList $ tl where
   tryReaction (TopClass nm0 q0 tys0) | nm == nm0 
-                                     , Just s0 <- findInstantiationChained TypeFamilyFree tys0 tys mempty -- The top-level axiom scheme can be instantiated to
+                                     , Just s0 <- findInstantiationChained TypeFamilyFree tys0 tys mempty
                                      = fail $ "DINSTG: top level axiom overlaps with given constraint."
                                      
 -- Try to canonicalize one atomic constraint. The atomic constraints from the given/wanted 
