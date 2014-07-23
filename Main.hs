@@ -9,13 +9,16 @@ import Data.Foldable hiding ( msum, and, or, concat )
 import Data.Traversable ( traverse )
 
 import Control.Monad
-import Control.Monad.State ( StateT (..) )
+import Control.Monad.State ( StateT (..), modify, get, put, runState)
 import Control.Applicative
 
-import Text.Read
+import Text.Read ( readMaybe )
 
 import Data.Maybe
 import Data.Char
+  ( ord
+  , chr
+  )
 import Data.Set ( Set (..), union, singleton, difference, isSubsetOf, intersection )
 
 import qualified Data.Set as Set
@@ -412,7 +415,7 @@ ruleCanon role (tch, subst, given, wanted) = pickFirst . map attempt $ choices w
       choices = map (\[q1] -> (q1, Set.difference pivot . singleton $ q1) ) . pick 1 . Set.toList $ pivot
  
       attempt :: (Constraint, Set Constraint) -> Solver (Maybe Quadruple)
-      attempt (q1, rest) = canon role q1 >>- \r ->
+      attempt (q1, rest) = canon role q1 & \r ->
         do (tch', subst', q2) <- r
            let replaced = Set.union q2 rest
 
@@ -494,7 +497,7 @@ ruleInteract role (tch, subst, given, wanted) = pickFirst . map attempt $ choice
       
       -- Let one pair interact
       attempt :: (Constraint, Constraint, Set Constraint) -> Solver (Maybe Quadruple)
-      attempt (q1, q2, rest) = interact q1 q2 >>- \r -> 
+      attempt (q1, q2, rest) = interact q1 q2 & \r -> 
           do q3 <- r
              let replaced = Set.union q3 rest
 
@@ -555,7 +558,7 @@ ruleSimplification (tch, subst, given, wanted) = pickFirst . map attempt . toLis
                  wanted `unionBind` \w ->
                  singleton $ (g, w, Set.delete w wanted)
                  
-      attempt (g, w, wanted') = simplifies g w >>- \r -> 
+      attempt (g, w, wanted') = simplifies g w & \r -> 
         do w <- r
            return ( tch
                   , subst
@@ -565,8 +568,8 @@ ruleSimplification (tch, subst, given, wanted) = pickFirst . map attempt . toLis
     
 
     
-(>>-) :: Functor f => f a -> (a -> b) -> f b
-(>>-) = flip fmap
+(&) :: Functor f => f a -> (a -> b) -> f b
+(&) = flip fmap
 
 newtype RigidSubst = RigidSubst { runRigidSubst :: Map.Map RV Monotype }
 
@@ -656,6 +659,7 @@ compat (tys1, ty1) (tys2, ty2) =
        Nothing -> True
 
 
+       
 -- Check if two equations are apart by flattening one of the equations and making 
 -- sure the the flattened equation doesn't unify with the other equation.
 apart :: Equation -> Equation -> Bool
@@ -665,23 +669,25 @@ apart (tys1, _) (tys2, _) =
        Nothing -> True
   where -- NOTE: `flatten` cannot be used outside `apart` due to the non-uniqueness of generated names.
     flatten :: [Monotype] -> [Monotype]
-    flatten tys = case sharpen tys Map.empty . map RV . map ("$@"++) . map show $ [0..] of
-                       (t, _, _) -> t
+    flatten tys = fst . runState (sharpen tys) $ ( Map.empty                                -- Initially the cache is empty
+                                                 , map RV . map ("$@"++) . map show $ [0..] -- Stream of 'fresh' rigid variables
+                                                 ) 
     
-    sharpen []                 prevs fresh = ([], fresh, prevs)
-    sharpen (t@(TyVar _)  :ts) prevs fresh = let (ts', fresh', prevs') = sharpen ts prevs fresh        
-                                             in (t : ts', fresh', prevs')
-    sharpen (t@(TyFam _ _):ts) prevs fresh = 
-                                case Map.lookup t prevs of
-                                  Just f  -> let (ts', fresh', prevs') = sharpen ts prevs fresh        
-                                             in (f : ts', fresh', prevs')
-                                  Nothing -> let plat = TyVar (RigidVariable $ head fresh)
-                                                 (ts', fresh', prevs') = sharpen ts (prevs `Map.union` Map.fromList [(t, plat)]) (tail fresh) 
-                                             in (plat : ts', fresh', prevs')
-    sharpen (t@(TyCon nm tys):ts) prevs fresh = 
-      let (newTys, fresh' , prevs' ) = sharpen tys prevs  fresh
-          (ts'   , fresh'', prevs'') = sharpen ts  prevs' fresh'
-      in (TyCon nm newTys : ts', fresh'', prevs'')
+    sharpen []                 = return []
+    sharpen (t@(TyVar _)  :ts) = do ts <- sharpen ts      
+                                    return (t : ts)
+    sharpen (t@(TyFam _ _):ts) = do (cache, fresh) <- get  
+                                    case Map.lookup t cache of         -- This exact type family was already encountered once before, 
+                                      Just f  -> do ts <- sharpen ts   -- reuse the generated free variable.
+                                                    return $ f : ts
+                                      Nothing -> do let plat = TyVar (RigidVariable $ head fresh)
+                                                    modify $ \(cache, fresh) -> (cache `Map.union` Map.fromList [(t, plat)], tail fresh)
+                                                    ts <- sharpen ts
+                                                    return $ plat : ts
+    sharpen (t@(TyCon nm tys):ts)  = 
+      do newTys <- sharpen tys
+         ts     <- sharpen ts 
+         return (TyCon nm newTys : ts)
       
 -- Choose the correct equation from a closed type family. Not optimized! See paper.
 -- The equations are tried one-by-one until the first one succeeds. Every equation
@@ -763,7 +769,7 @@ ruleTop tl role (tch, subst, given, wanted) = pickFirst . map attempt $ choices 
       choices = map (\[q1] -> (q1, Set.difference pivot . singleton $ q1) ) . pick 1 . toList $ pivot
  
       attempt :: (Constraint, Set Constraint) -> Solver (Maybe Quadruple)
-      attempt (q1, rest) = topreact tl role q1 >>- \r ->
+      attempt (q1, rest) = topreact tl role q1 & \r ->
         do (tch', q2) <- r
            let replaced = union q2 rest
 
@@ -813,7 +819,7 @@ extractSubstitution assocList =
       residual = join . map (\(t, xs) -> map (\x -> (t, x)) xs) . Map.toList $ Map.map snd magicMap
       
   in ( Subst $ Map.map fst magicMap
-     , Set.fromList $ residual >>- \(b, t) -> Equality $ TyVar (UnificationVariable b) :~ t
+     , Set.fromList $ residual & \(b, t) -> Equality $ TyVar (UnificationVariable b) :~ t
      )  
 
 simplifier :: Set Toplevel                     -- Top-level constraints
@@ -827,7 +833,7 @@ simplifier tl oldGiven oldTouch oldWanted =
      (newTouch, phi, newGiven, newWanted) <- rewriter' tl (oldTouch, mempty, oldGiven, oldWanted)
      
      let -- Page 66: 7.5, (3)
-         seperated = Set.toList (phi `applySubst` newWanted) >>- \case
+         seperated = Set.toList (phi `applySubst` newWanted) & \case
                                       r@(Equality (TyVar (UnificationVariable b) :~ t)) -> if (b `Set.member` newTouch) && not (b `Set.member` fuv t)
                                                                                               then (Just (b, t), Nothing)
                                                                                               else (Nothing    , Just r )
